@@ -1,0 +1,14 @@
+# Cache files
+**/aiohttp_cache.sqlite
+**/cache/
+__pycache__/
+#**/data_cache/
+
+# System files
+.DS_Store
+.localized
+
+
+# Exceptions - add specific files you want to keep despite matching above patterns
+!README.md
+!requirements.txt 
