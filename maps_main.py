@@ -268,15 +268,15 @@ def generate_map(coordinates,
     
     # Get water mask if requested
     water_mask = None
-    if include_water:
+    if include_water and water_layer is not None:
         water_mask = water_layer.get_water_mask(
             polygon_geom=polygon,
             dem_data=dem_data,
             use_cache=use_cache
         )
     
-    # Generate hillshade
-    hillshade_img = create_hillshade(
+    # Create hillshade
+    hillshade = create_hillshade(
         dem_data=dem_data,
         sun_azimuth=sun_azimuth,
         sun_altitude=sun_altitude,
@@ -297,14 +297,14 @@ def generate_map(coordinates,
     dem_data.rio.to_raster(dem_path)
     
     # Save basic hillshade
-    hillshade_img.save(hillshade_path)
+    hillshade.save(hillshade_path)
     
     
     print(f"Generated hillshade map at {hillshade_path}")
     print(f"DEM resolution: {metadata['resolution']}m")
-    print(f"Image dimensions: {hillshade_img.size}")
+    print(f"Image dimensions: {hillshade.size}")
     
-    return hillshade_img, dem_data, metadata
+    return hillshade, dem_data, metadata
 
 if __name__ == "__main__":
     # Example usage
