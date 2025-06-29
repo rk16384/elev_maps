@@ -4,13 +4,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 import xdem
 from map_layers import ElevationLayer, WaterLayer
-from utils import reproject_to_web_mercator
+from utils import reproject_to_web_mercator, create_extrusion_shadow
 import math
+import geopandas as gpd
+from typing import Optional
 
 def create_hillshade(dem_data, 
                     sun_azimuth=315,
                     sun_altitude=45,
-                    vertical_exaggeration=1.0,
                     water_mask=None,
                     water_color=70,
                     gaussian_blur_sigma=0):
@@ -30,8 +31,8 @@ def create_hillshade(dem_data,
         PIL.Image: The generated hillshade image
     """
     # Apply vertical exaggeration
-    if vertical_exaggeration != 1.0:
-        dem_data = dem_data * vertical_exaggeration
+    # if vertical_exaggeration != 1.0:
+    #     dem_data = dem_data * vertical_exaggeration
 
     dem = xdem.DEM.from_array(
         dem_data.values.squeeze(),  # Get the numpy array and remove single dimensions
@@ -68,14 +69,12 @@ def create_hillshade(dem_data,
 def create_printable_map(hillshade_img: Image.Image,
                         title: str,
                         output_prefix: str,
-                        sun_azimuth: float = 315,
-                        sun_altitude: float = 45,
+                        shadow_img: Image.Image,
+                        shadow_offsets: tuple[int, int],
                         width_inches: float = 5.0,
                         height_inches: float = 7.0,
                         margin_inches: float = 0.25,
-                        dpi: int = 300,
-                        shadow_blur: float = 20,
-                        shadow_opacity: float = 0.5) -> tuple[str, str]:
+                        dpi: int = 300) -> tuple[str, str]:
     """
     Create printable versions (PDF and high-res image) of a hillshade map with title and drop shadow.
     
@@ -83,14 +82,12 @@ def create_printable_map(hillshade_img: Image.Image,
         hillshade_img: Input hillshade PIL Image
         title: Map title text
         output_prefix: Prefix for output filenames (without extension)
-        sun_azimuth: Sun direction in degrees (0=North, 90=East)
-        sun_altitude: Sun elevation in degrees (0=horizon, 90=overhead)
+        shadow_img: Pre-rendered shadow layer image.
+        shadow_offsets: (x, y) offset of the hillshade within the shadow image.
         width_inches: Output width in inches
         height_inches: Output height in inches
         margin_inches: Margin between hillshade and edge in inches
         dpi: Output resolution in dots per inch
-        shadow_blur: Base shadow blur radius (will be scaled with image size)
-        shadow_opacity: Shadow opacity (0-1)
     
     Returns:
         tuple[str, str]: Paths to the generated PDF and image files
@@ -126,49 +123,32 @@ def create_printable_map(hillshade_img: Image.Image,
     
     hillshade_resized = hillshade_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
     
-    # Calculate positioning
+    # Calculate positioning for the hillshade image
     x_offset = (width_px - new_width) // 2
     y_offset = title_height_px + ((height_px - title_height_px - new_height) // 2)
     
-    # Scale shadow blur based on image size
-    # Use the smaller dimension to ensure shadow doesn't get too large
-    scale_factor = min(new_width, new_height) / 1000  # baseline for 1000px image
-    scaled_shadow_blur = max(int(shadow_blur * scale_factor), 1)
+    # --- New Shadow Logic ---
+    # Resize the shadow image and place it on the canvas
+    dem_width_orig, _ = hillshade_img.size
+    resize_factor = new_width / dem_width_orig
+
+    shadow_img_resized = shadow_img.resize(
+        (int(shadow_img.width * resize_factor), int(shadow_img.height * resize_factor)),
+        Image.Resampling.LANCZOS
+    )
     
-    # Create drop shadow with gradient edges
-    # Create a larger shadow image to account for blur
-    padding = scaled_shadow_blur * 4
-    shadow_width = new_width + padding * 2
-    shadow_height = new_height + padding * 2
-    shadow = Image.new('RGBA', (shadow_width, shadow_height), (0, 0, 0, 0))
-    shadow_draw = ImageDraw.Draw(shadow)
+    # Calculate the offset of the DEM area within the *resized* shadow image
+    shadow_dem_offset_x = int(shadow_offsets[0] * resize_factor)
+    shadow_dem_offset_y = int(shadow_offsets[1] * resize_factor)
+
+    # Calculate the paste position for the entire shadow image on the background
+    shadow_pos_x = x_offset - shadow_dem_offset_x
+    shadow_pos_y = y_offset - shadow_dem_offset_y
     
-    # Draw the core shadow
-    shadow_draw.rectangle((
-        padding,
-        padding,
-        padding + new_width,
-        padding + new_height
-    ), fill=(128, 128, 128, int(255 * shadow_opacity)))
+    # Paste the shadow image (which includes the white buffer) onto the main canvas
+    background.paste(shadow_img_resized, (shadow_pos_x, shadow_pos_y))
     
-    # Apply gaussian blur to create soft edges
-    shadow = shadow.filter(ImageFilter.GaussianBlur(scaled_shadow_blur))
-    
-    # Calculate shadow offset based on sun position
-    shadow_distance = int(scaled_shadow_blur * 2)  # Base distance in pixels
-    # Convert sun position to x,y offset
-    angle_rad = math.radians(sun_azimuth + 90)  # Adjust azimuth to standard coordinate system
-    shadow_x = int(math.cos(angle_rad) * shadow_distance)
-    shadow_y = int(math.sin(angle_rad) * shadow_distance)
-    
-    # Calculate the shadow position on the background
-    shadow_pos_x = x_offset + shadow_x - padding
-    shadow_pos_y = y_offset + shadow_y - padding
-    
-    # Paste shadow onto background with the full padded size
-    background.paste(shadow, (shadow_pos_x, shadow_pos_y), shadow)
-    
-    # Paste hillshade onto background
+    # Paste hillshade onto background, over the shadow layer
     background.paste(hillshade_resized, (x_offset, y_offset))
     
     # Calculate font size based on available title space and title length
@@ -218,6 +198,7 @@ def create_printable_map(hillshade_img: Image.Image,
     
     return pdf_path, img_path
 
+
 def generate_map(coordinates, 
                 location_name="unnamed",
                 resolution=None,
@@ -260,12 +241,20 @@ def generate_map(coordinates,
     dem_data, metadata = elevation_layer.get_dem(
         polygon_geom=polygon,
         resolution=resolution,
-        use_cache=use_cache
+        use_cache=use_cache,
+        vertical_exaggeration=vertical_exaggeration
     )
     
     # Reproject DEM to Web Mercator for accurate distance calculations
     dem_data = reproject_to_web_mercator(dem_data)
+
+    shadow_img, shadow_offsets = create_extrusion_shadow(dem_data,
+                                        light_elevation_deg=65,
+                                        light_azimuth=sun_azimuth,
+                                        scale=0.2)
     
+    #
+
     # Get water mask if requested
     water_mask = None
     if include_water and water_layer is not None:
@@ -280,7 +269,6 @@ def generate_map(coordinates,
         dem_data=dem_data,
         sun_azimuth=sun_azimuth,
         sun_altitude=sun_altitude,
-        vertical_exaggeration=vertical_exaggeration,
         water_mask=water_mask,
         water_color=water_color,
         gaussian_blur_sigma=gaussian_blur_sigma
@@ -304,7 +292,7 @@ def generate_map(coordinates,
     print(f"DEM resolution: {metadata['resolution']}m")
     print(f"Image dimensions: {hillshade.size}")
     
-    return hillshade, dem_data, metadata
+    return hillshade, dem_data, metadata, shadow_img, shadow_offsets
 
 if __name__ == "__main__":
     # Example usage
@@ -338,7 +326,7 @@ if __name__ == "__main__":
     sun_azimuth = 315
     sun_altitude = 45
 
-    hillshade_img, dem_data, metadata = generate_map(
+    hillshade_img, dem_data, metadata, shadow_img, shadow_offsets = generate_map(
         coordinates=astoria2_coords,
         location_name="astoria",
         vertical_exaggeration=3.0,
@@ -355,16 +343,14 @@ if __name__ == "__main__":
     printable_base = os.path.join(output_dir, f"{title}_print")
     pdf_path, print_img_path = create_printable_map(
         hillshade_img=hillshade_img,
+        shadow_img=shadow_img,
+        shadow_offsets=shadow_offsets,
         title=title,
         output_prefix=printable_base,
-        sun_azimuth=sun_azimuth,
-        sun_altitude=sun_altitude,
         width_inches=5.0,
         height_inches=7.0,
         margin_inches=0.5,
-        dpi=300,
-        shadow_blur=20,
-        shadow_opacity=0.8
+        dpi=300
     )
     print(f"Generated printable map versions:")
     print(f"PDF: {pdf_path}")
