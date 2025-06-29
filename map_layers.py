@@ -210,7 +210,8 @@ class ElevationLayer(BaseLayer):
 
     def get_dem(self, polygon_geom: Polygon, 
                 resolution: Optional[int] = None,
-                use_cache: bool = True) -> Tuple[xarray.DataArray, Dict[str, Any]]:
+                use_cache: bool = True,
+                vertical_exaggeration: float = 1.0) -> Tuple[xarray.DataArray, Dict[str, Any]]:
         """
         Main method to get DEM data.
         
@@ -218,7 +219,7 @@ class ElevationLayer(BaseLayer):
             polygon_geom: Shapely Polygon defining the area of interest
             resolution: Optional specific resolution in meters
             use_cache: Whether to use cached data if available
-            
+            vertical_exaggeration: Vertical exaggeration factor
         Returns:
             Tuple of (dem_data, metadata)
         """
@@ -230,6 +231,9 @@ class ElevationLayer(BaseLayer):
         
         dem_data, metadata = self._fetch_from_source(polygon_geom, resolution)
         self._save_to_cache(dem_data, cache_path)
+
+        dem_data = dem_data * vertical_exaggeration
+        metadata["vertical_exaggeration"] = vertical_exaggeration
         
         return dem_data, metadata
 
