@@ -14,7 +14,8 @@ def create_hillshade(dem_data,
                     sun_altitude=45,
                     water_mask=None,
                     water_color=70,
-                    gaussian_blur_sigma=0):
+                    gaussian_blur_sigma=0,
+                    vertical_exaggeration=1.0):
     """
     Generate a hillshade from DEM data with optional water mask.
     
@@ -30,15 +31,15 @@ def create_hillshade(dem_data,
     Returns:
         PIL.Image: The generated hillshade image
     """
-    # Apply vertical exaggeration
-    # if vertical_exaggeration != 1.0:
-    #     dem_data = dem_data * vertical_exaggeration
-
     dem = xdem.DEM.from_array(
-        dem_data.values.squeeze(),  # Get the numpy array and remove single dimensions
+        dem_data.values.squeeze(),
         transform=dem_data.rio.transform(),
         crs=dem_data.rio.crs
     )
+
+    # Apply vertical exaggeration to the DEM data before hillshade calculation
+    if vertical_exaggeration != 1.0:
+        dem.data = dem.data * vertical_exaggeration
 
     # Generate hillshade
     hillshade = xdem.terrain.hillshade(
@@ -47,10 +48,11 @@ def create_hillshade(dem_data,
         altitude=sun_altitude
     )
 
-    # Convert to 8-bit grayscale more robustly
+    # Convert to 8-bit grayscale with enhanced contrast
     hillshade_data = hillshade.data.squeeze()
-    # replace nan with min
     hillshade_data = np.nan_to_num(hillshade_data, nan=hillshade_data.min())
+    
+    # Apply contrast enhancement
     hillshade_uint8 = ((hillshade_data - hillshade_data.min()) * 255 / 
                        (hillshade_data.max() - hillshade_data.min())).astype(np.uint8)
 
@@ -181,7 +183,7 @@ def create_printable_map(hillshade_img: Image.Image,
         # Center title vertically in the title space
         # if the image was width limited, center vertically
         if new_width < new_height:
-            title_y = (y_offset - title_height) // 2
+            title_y = (y_offset - title_height_px) // 2
         else:
             title_y = (title_height_px - title_height) // 2 + margin_px
         draw.text((title_x, title_y), title, fill='black', font=font)
@@ -241,8 +243,7 @@ def generate_map(coordinates,
     dem_data, metadata = elevation_layer.get_dem(
         polygon_geom=polygon,
         resolution=resolution,
-        use_cache=use_cache,
-        vertical_exaggeration=vertical_exaggeration
+        use_cache=use_cache
     )
     
     # Reproject DEM to Web Mercator for accurate distance calculations
@@ -271,7 +272,8 @@ def generate_map(coordinates,
         sun_altitude=sun_altitude,
         water_mask=water_mask,
         water_color=water_color,
-        gaussian_blur_sigma=gaussian_blur_sigma
+        gaussian_blur_sigma=gaussian_blur_sigma,
+        vertical_exaggeration=vertical_exaggeration
     )
     
     # Save basic outputs
@@ -323,13 +325,13 @@ if __name__ == "__main__":
     ]
     
     title = "Astoria"
-    sun_azimuth = 315
-    sun_altitude = 45
+    sun_azimuth = 300
+    sun_altitude = 65
 
     hillshade_img, dem_data, metadata, shadow_img, shadow_offsets = generate_map(
         coordinates=astoria2_coords,
         location_name="astoria",
-        vertical_exaggeration=3.0,
+        vertical_exaggeration=5.0,
         sun_azimuth=sun_azimuth,  # Light from northwest
         sun_altitude=sun_altitude,
         include_water=True,
