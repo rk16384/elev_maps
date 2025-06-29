@@ -6,6 +6,8 @@ import xdem
 from map_layers import ElevationLayer, WaterLayer
 from utils import reproject_to_web_mercator, create_extrusion_shadow
 import math
+import geopandas as gpd
+from typing import Optional
 
 def create_hillshade(dem_data, 
                     sun_azimuth=315,

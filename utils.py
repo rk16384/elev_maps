@@ -8,6 +8,8 @@ from functools import partial
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
 import math
+import geopandas as gpd
+import shapely
 
 
 def bbox_to_land_area(nw_corner: Tuple[float, float], se_corner: Tuple[float, float]) -> float:
@@ -263,3 +265,109 @@ def create_extrusion_shadow(
 
     print("Shadow generation complete.")
     return final_image, (final_dem_offset_x, final_dem_offset_y)
+
+def _convert_coastline_to_polygon(self, coastline_features: gpd.GeoDataFrame, bbox_polygon: Polygon) -> gpd.GeoDataFrame:
+    """
+    Convert coastline features into water body polygons using reference land geometry.
+    
+    Args:
+        coastline_features: GeoDataFrame containing coastline and other water features
+        bbox_polygon: Shapely Polygon representing the bounding box
+        
+    Returns:
+        GeoDataFrame with converted water body polygons
+    """
+    if coastline_features.empty:
+        return coastline_features
+
+    try:
+        # Ensure all geometries are in the same CRS
+        if self.reference_land_geometry is not None:
+            # Create a GeoDataFrame for the reference land with WGS84 CRS
+            ref_gdf = gpd.GeoDataFrame(geometry=[self.reference_land_geometry], crs="EPSG:4326")
+            
+            # Transform reference land to match coastline features CRS
+            if coastline_features.crs != ref_gdf.crs:
+                ref_gdf = ref_gdf.to_crs(coastline_features.crs)
+            reference_land = ref_gdf.geometry.iloc[0]
+            
+            # Create a GeoDataFrame for the bbox_polygon with the same CRS as coastline features
+            bbox_gdf = gpd.GeoDataFrame(geometry=[bbox_polygon], crs=coastline_features.crs)
+        else:
+            raise ValueError("Reference land geometry is required but not available")
+
+        # Separate coastlines from other water features
+        coastlines = coastline_features[coastline_features['FCODE'] == 56600].copy()
+        other_water = coastline_features[coastline_features['FCODE'] != 56600].copy()
+
+        if coastlines.empty:
+            print("No coastline features found, returning original water features")
+            return coastline_features
+
+        # Merge all coastlines and clip to bbox
+        merged_coastline = coastlines.geometry.unary_union
+        clipped_coastline = merged_coastline.intersection(bbox_polygon)
+
+        if clipped_coastline.is_empty:
+            print("No coastline intersection with bounding box")
+            return other_water
+
+        # Split the bbox using the coastline
+        split_result = shapely.ops.split(bbox_polygon, clipped_coastline)
+        
+        # Handle the split result based on its type
+        if isinstance(split_result, shapely.geometry.GeometryCollection):
+            # Extract only the Polygon and MultiPolygon geometries
+            split_polygons = [geom for geom in split_result.geoms 
+                            if isinstance(geom, (shapely.geometry.Polygon, shapely.geometry.MultiPolygon))]
+        else:
+            split_polygons = list(split_result)
+        
+        if len(split_polygons) < 2:
+            print("Warning: Coastline did not properly split the bounding box")
+            return other_water
+
+        # Identify the ocean polygon using the reference land geometry
+        ocean_polygon = None
+        for polygon in split_polygons:
+            # Handle both Polygon and MultiPolygon
+            if isinstance(polygon, shapely.geometry.MultiPolygon):
+                # For MultiPolygon, check the largest component
+                largest = max(polygon.geoms, key=lambda p: p.area)
+                rep_point = largest.representative_point()
+            else:
+                rep_point = polygon.representative_point()
+            
+            if not reference_land.contains(rep_point):
+                ocean_polygon = polygon
+                break
+
+        if ocean_polygon is None:
+            print("Warning: Could not identify ocean polygon")
+            return other_water
+
+        # Create final water geometry by merging ocean with other water features
+        all_water_geometries = [ocean_polygon]
+        if not other_water.empty:
+            all_water_geometries.extend(other_water.geometry.tolist())
+
+        final_water_geometry = shapely.ops.unary_union(all_water_geometries)
+
+        # Create new GeoDataFrame with the final water geometry
+        water_gdf = gpd.GeoDataFrame(
+            {
+                'geometry': [final_water_geometry],
+                'FCODE': [44500],  # SeaOcean code
+                'FTYPE': ['SeaOcean']
+            },
+            crs=coastline_features.crs
+        )
+
+        print(f"Created unified water geometry with area: {final_water_geometry.area}")
+        return water_gdf
+
+    except Exception as e:
+        print(f"Error in coastline conversion: {e}")
+        import traceback
+        traceback.print_exc()
+        return coastline_features
