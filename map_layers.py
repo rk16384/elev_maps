@@ -24,6 +24,9 @@ from functools import partial
 from urllib.parse import quote
 import xarray
 import shapely
+import tempfile
+import rasterio
+from rasterio.merge import merge as rio_merge
 
 class BaseLayer(ABC):
 
@@ -117,10 +120,19 @@ class ElevationLayer(BaseLayer):
         bbox = polygon_geom.bounds  # (minx, miny, maxx, maxy)
         bbox_str = format_bbox_string(bbox)
         res_str = f"{resolution}m" if resolution else "auto"
+
+        metadata = {
+            "resolution":resolution,
+            "crs": None,
+            "bbox": bbox_str,
+            "shape": None,
+            "nodata_value": None
+        }
+
         return os.path.join(
             self.cache_dir,
             f"{self.name}_{self.location_name}_{bbox_str}_{res_str}.tif"
-        )
+        ), metadata
 
     def _fetch_from_source(self, polygon_geom: Polygon, 
                           target_resolution: Optional[int] = None) -> Tuple[xarray.DataArray, Dict[str, Any]]:
@@ -223,7 +235,7 @@ class ElevationLayer(BaseLayer):
         Returns:
             Tuple of (dem_data, metadata)
         """
-        cache_path = self._get_cache_filepath(polygon_geom, resolution)
+        cache_path, metadata = self._get_cache_filepath(polygon_geom, resolution)
         
         if use_cache and os.path.exists(cache_path):
             print(f"Loading cached DEM from {cache_path}")
@@ -236,6 +248,154 @@ class ElevationLayer(BaseLayer):
         metadata["vertical_exaggeration"] = vertical_exaggeration
         
         return dem_data, metadata
+
+    def get_mosaic_dem(self, polygon_geom, use_cache=True, vertical_exaggeration=1.0):
+        land_area = bbox_to_land_area(polygon_geom)
+        valid_resolutions = land_area_to_resolution(land_area)  # e.g., [1, 3, 10, 30, 100]
+        minx, miny, maxx, maxy = polygon_geom.bounds
+
+        # Check for cached mosaic
+        mosaic_cache_path, metadata = self._get_cache_filepath(polygon_geom, resolution='mosaic')
+        if use_cache and os.path.exists(mosaic_cache_path):
+            print(f"Loading cached mosaic DEM from {mosaic_cache_path}")
+            mosaic = rioxarray.open_rasterio(mosaic_cache_path).squeeze()
+            mosaic = mosaic * vertical_exaggeration
+            return mosaic, metadata
+
+        # Choose a tile size based on the highest resolution
+        if 1 in valid_resolutions:
+            tile_size = 0.01  # ~1km
+        elif 3 in valid_resolutions:
+            tile_size = 0.03  # ~3km
+        elif 10 in valid_resolutions:
+            tile_size = 0.05  # ~5km
+        elif 30 in valid_resolutions:
+            tile_size = 0.1   # ~10km
+        else:
+            tile_size = 0.25  # fallback
+
+        overlap = 0.01
+        # Generate tiles
+        tiles = []
+        x = minx
+        while x < maxx:
+            y = miny
+            while y < maxy:
+                tile = box(
+                            max(minx, x - overlap),
+                            max(miny, y - overlap),
+                            min(maxx, x + tile_size + overlap),
+                            min(maxy, y + tile_size + overlap)
+                        )
+                tiles.append(tile)
+                y += tile_size
+            x += tile_size
+
+        # Download highest available resolution for each tile
+        tile_dems = []
+        fetched_resolutions = {}
+        metadata = {}
+        for i, tile in enumerate(tiles):
+            dem_data = None
+            for res in valid_resolutions:
+                if res not in fetched_resolutions:
+                    fetched_resolutions[res] = 0
+                try:
+                    dem_data, metadata = self._fetch_from_source(tile, target_resolution=res)
+                    fetched_resolutions[res] += 1
+                    break
+                except Exception as e:
+                    continue
+            if dem_data is not None:
+                tile_dems.append(dem_data)
+            else:
+                print(f"WARNING: No DEM available for tile {tile.bounds}")
+
+            print(f"Fetched {i}/{len(tiles)} tiles")
+            print(f"Fetched resolutions: {fetched_resolutions}")
+
+        # Save each tile to a temporary file
+        temp_files = []
+        for i, dem in enumerate(tile_dems):
+            temp_file = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+            dem.rio.to_raster(temp_file.name)
+            temp_files.append(temp_file.name)
+
+        # Open all tiles as rasterio datasets
+        srcs = [rasterio.open(f) for f in temp_files]
+        mosaic_arr, out_trans = rio_merge(srcs, method='first')
+
+        # Debug: Check mosaic array for NaN values
+        print(f"Mosaic array shape: {mosaic_arr.shape}")
+        print(f"Mosaic array dtype: {mosaic_arr.dtype}")
+        print(f"NaN values in mosaic: {np.isnan(mosaic_arr).sum()}")
+        print(f"Min/Max values: {np.nanmin(mosaic_arr):.2f}/{np.nanmax(mosaic_arr):.2f}")
+
+        # Optionally, close files and clean up
+        for src in srcs:
+            src.close()
+        for f in temp_files:
+            os.remove(f)
+
+        # Convert the numpy array back to a DataArray
+        # Use the metadata from the first tile for CRS, etc.
+        first_tile = tile_dems[0]
+        # mosaic_da = rioxarray.open_rasterio(
+        #     rasterio.io.MemoryFile().open(
+        #         driver='GTiff',
+        #         width=mosaic_arr.shape[2],
+        #         height=mosaic_arr.shape[1],
+        #         count=1,
+        #         dtype=mosaic_arr.dtype,
+        #         transform=out_trans,
+        #         crs=first_tile.rio.crs
+        #     )
+        # )
+        # Or, if you want to avoid MemoryFile, you can use rioxarray's from_array:
+        import xarray as xr
+        # mosaic_arr shape: (bands, height, width)
+        height, width = mosaic_arr.shape[1], mosaic_arr.shape[2]
+        transform = out_trans
+
+        # Generate coordinates using the transform
+        x_coords = np.array([transform * (i, 0) for i in range(width)])[:, 0]
+        y_coords = np.array([transform * (0, j) for j in range(height)])[:, 1]
+
+        mosaic_da = xr.DataArray(
+            mosaic_arr[0],  # [0] if single band
+            dims=("y", "x"),
+            coords={
+                "y": y_coords,
+                "x": x_coords,
+            },
+            attrs=first_tile.attrs
+        )
+        mosaic_da = mosaic_da.rio.write_crs(first_tile.rio.crs)
+        mosaic_da = mosaic_da.rio.write_transform(out_trans)
+
+        # Debug: Check DataArray before vertical exaggeration
+        print(f"DataArray shape: {mosaic_da.shape}")
+        print(f"DataArray NaN values: {np.isnan(mosaic_da.values).sum()}")
+        print(f"DataArray Min/Max: {np.nanmin(mosaic_da.values):.2f}/{np.nanmax(mosaic_da.values):.2f}")
+
+        # Apply vertical exaggeration
+        mosaic_da = mosaic_da * vertical_exaggeration
+
+        # Debug: Check after vertical exaggeration
+        print(f"After vertical exaggeration - NaN values: {np.isnan(mosaic_da.values).sum()}")
+
+        # Save the full mosaic to cache
+        mosaic_da.rio.to_raster(mosaic_cache_path)
+        print(f"Saved mosaic DEM to {mosaic_cache_path}")
+
+        # After creating mosaic_da
+        mosaic_da = mosaic_da.rio.clip_box(minx, miny, maxx, maxy)
+        
+        # Debug: Check after clipping
+        print(f"After clipping - NaN values: {np.isnan(mosaic_da.values).sum()}")
+        print(f"After clipping - Min/Max: {np.nanmin(mosaic_da.values):.2f}/{np.nanmax(mosaic_da.values):.2f}")
+
+        return mosaic_da, metadata
 
 class WaterLayer(BaseLayer):
     def __init__(self, cache_dir: str, location_name: str = "unnamed"):

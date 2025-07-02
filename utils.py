@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 import xarray
 import pyproj
 from shapely.geometry import Polygon
@@ -12,38 +12,38 @@ import geopandas as gpd
 import shapely
 
 
-def bbox_to_land_area(nw_corner: Tuple[float, float], se_corner: Tuple[float, float]) -> float:
+def bbox_to_land_area(polygon_or_bbox: Union[Tuple[float, float, float, float], Polygon]) -> float:
     """
-    Calculate the land area of a bounding box in square meters.
+    Calculate the land area of a bounding box or polygon in square meters.
 
     Args:
-        nw_corner (tuple): (longitude, latitude) of the northwest corner
-        se_corner (tuple): (longitude, latitude) of the southeast corner
+        polygon_or_bbox: Either a shapely Polygon or a (west, south, east, north) tuple
 
     Returns:
         float: The area in square meters
     """
-    # Define the polygon from bounding box corners in WGS84 (latitude/longitude)
-    polygon_wgs84 = Polygon([
-        (nw_corner[0], nw_corner[1]),  # NW corner
-        (se_corner[0], nw_corner[1]),  # NE corner
-        (se_corner[0], se_corner[1]),  # SE corner
-        (nw_corner[0], se_corner[1])   # SW corner
-    ])
+    if isinstance(polygon_or_bbox, Polygon):
+        polygon_wgs84 = polygon_or_bbox
+    else:
+        # Assume (west, south, east, north) tuple
+        bbox = polygon_or_bbox
+        polygon_wgs84 = Polygon([
+            (bbox[0], bbox[3]),  # NW corner
+            (bbox[2], bbox[3]),  # NE corner
+            (bbox[2], bbox[1]),  # SE corner
+            (bbox[0], bbox[1])   # SW corner
+        ])
 
     # Use a local Azimuthal Equidistant projection centered on the polygon
-    # This projection is well-suited for preserving area for a local region
     lon_c = polygon_wgs84.centroid.x
     lat_c = polygon_wgs84.centroid.y
 
-    # Define the transformation from WGS84 to the custom AEQD projection
     project = partial(
         pyproj.transform,
         pyproj.Proj(proj='latlong', datum='WGS84'),
         pyproj.Proj(proj='aeqd', lat_0=lat_c, lon_0=lon_c)
     )
 
-    # Apply the projection and get the area in square meters
     projected_polygon = transform(project, polygon_wgs84)
     return projected_polygon.area
 
@@ -61,7 +61,7 @@ def land_area_to_resolution(land_area: float) -> List[int]:
     pixel_area = 4800 * 6000
 
     # Calculate minimum pixel size with a 2.5x safety factor
-    minimum_pixel_size = np.sqrt(land_area / pixel_area) * 2.5
+    minimum_pixel_size = np.sqrt(land_area / pixel_area) / 2
 
     # Available resolutions in meters (from highest to lowest quality)
     valid_search_resolutions = [1, 3, 10, 30, 100]
@@ -164,13 +164,13 @@ def create_extrusion_shadow(
     # Find max elevation from the to calculate the necessary padding around the image
     # if phi deg between 0 and 90, check the left and bottom, if 90 to 180, check the right and bottom, if 180 to 270, check the right and top, if 270 to 360, check the left and top
     if phi_deg >= 180 and phi_deg < 270:
-        max_z = np.max(np.concatenate((dem_data_scaled[:, -1], dem_data_scaled[-1, :]))) # left and bottom
+        max_z = np.nanmax(np.concatenate((dem_data_scaled[:, -1], dem_data_scaled[-1, :]))) # left and bottom
     elif phi_deg >= 270 and phi_deg < 360:
-        max_z = np.max(np.concatenate((dem_data_scaled[:, -1], dem_data_scaled[0, :]))) # left and top
+        max_z = np.nanmax(np.concatenate((dem_data_scaled[:, -1], dem_data_scaled[0, :]))) # left and top
     elif phi_deg >= 90 and phi_deg < 180:
-        max_z = np.max(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[0, :]))) # right and top
+        max_z = np.nanmax(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[0, :]))) # right and top
     elif phi_deg >= 0 and phi_deg < 90:
-        max_z = np.max(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[-1, :]))) # right and bottom
+        max_z = np.nanmax(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[-1, :]))) # right and bottom
     
 
     max_shadow_len = (max_z * scale) / tan_theta
@@ -212,6 +212,9 @@ def create_extrusion_shadow(
         z = dem_data_scaled[y, x]
         if z <= 0:
             continue
+        if z.item() is np.nan:
+            z = 0
+
 
         shadow_len = (z * scale) / tan_theta
 
