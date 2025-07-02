@@ -11,4 +11,4 @@ __pycache__/
 
 # Exceptions - add specific files you want to keep despite matching above patterns
 !README.md
-!requirements.txt 
+!requirements.txt maps/output/*.tif
