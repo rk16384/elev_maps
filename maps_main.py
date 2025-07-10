@@ -316,6 +316,8 @@ def generate_map(coordinates,
     return hillshade, dem_data, metadata, shadow_img, shadow_offsets
 
 if __name__ == "__main__":
+
+    # TODO read args from a config file
     # Example usage
     # Define a polygon around Mount Rainier
     rainier_coords = [
