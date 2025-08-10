@@ -15,6 +15,7 @@ from shapely.geometry import box, Polygon
 import pynhd
 import pygeohydro as gh
 import requests
+import io
 import pandas as pd
 from typing import Tuple, Optional, Dict, Any
 from utils import bbox_to_land_area, land_area_to_resolution, reproject_to_web_mercator, format_bbox_string
@@ -27,6 +28,11 @@ import shapely
 import tempfile
 import rasterio
 from rasterio.merge import merge as rio_merge
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class FetchError(Exception):
+    """Custom exception for DEM fetching failures."""
+    pass
 
 class BaseLayer(ABC):
 
@@ -104,35 +110,51 @@ class ElevationLayer(BaseLayer):
     def __init__(self, cache_dir: str, location_name: str = "unnamed"):
         super().__init__(cache_dir)
         self.location_name = location_name
+        self.land_shapefile_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets", "reference_data", "ne_50m_land.shp"
+        )
+        self.land_gdf = self._load_land_gdf()
 
     @property
     def name(self):
         return "elevation_dem"
 
-    def _get_cache_filepath(self, polygon_geom: Polygon, resolution: Optional[int] = None) -> str:
+    def _get_cache_filepath(self, polygon_geom: Polygon, resolution: Optional[any] = None, is_tile: bool = False) -> str:
         """
         Generate cache filepath based on polygon bounds and resolution.
         
         Args:
             polygon_geom: Shapely Polygon defining the area of interest
-            resolution: Optional specific resolution in meters
+            resolution: Optional specific resolution in meters, or 'mosaic'
+            is_tile: If True, save to the 'tiles' subdirectory
         """
         bbox = polygon_geom.bounds  # (minx, miny, maxx, maxy)
         bbox_str = format_bbox_string(bbox)
-        res_str = f"{resolution}m" if resolution else "auto"
+        
+        res_str = f"{resolution}m" if isinstance(resolution, (int, float, np.number)) else str(resolution)
+        
+        filename = f"{self.name}_{self.location_name}_{bbox_str}_{res_str}.tif"
+
+        # Determine the directory
+        base_dir = self.cache_dir
+        if is_tile:
+            # Place individual tiles in a subdirectory to keep the main cache clean
+            tile_dir = os.path.join(base_dir, "tiles")
+            os.makedirs(tile_dir, exist_ok=True)
+            cache_path = os.path.join(tile_dir, filename)
+        else:
+            cache_path = os.path.join(base_dir, filename)
 
         metadata = {
-            "resolution":resolution,
+            "resolution": resolution,
             "crs": None,
             "bbox": bbox_str,
             "shape": None,
             "nodata_value": None
         }
 
-        return os.path.join(
-            self.cache_dir,
-            f"{self.name}_{self.location_name}_{bbox_str}_{res_str}.tif"
-        ), metadata
+        return cache_path, metadata
 
     def _fetch_from_source(self, polygon_geom: Polygon, 
                           target_resolution: Optional[int] = None) -> Tuple[xarray.DataArray, Dict[str, Any]]:
@@ -161,12 +183,40 @@ class ElevationLayer(BaseLayer):
         for resolution in resolutions:
             try:
                 print(f"Attempting to fetch DEM at {resolution}m resolution...")
-                dem_data_attempt = py3dep.get_map(
-                    layers='DEM',
-                    geometry=polygon_geom,  # py3dep accepts Shapely geometries
-                    resolution=resolution,
-                    crs="EPSG:4326"
-                )
+                
+                # Manually construct the request to bypass py3dep and control the timeout
+                base_url = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+                
+                # Calculate image size from resolution and add a safety limit
+                deg_to_m = 111320 # Approximation for degrees to meters at mid-latitudes
+                width = int((bbox[2] - bbox[0]) * deg_to_m / resolution)
+                height = int((bbox[3] - bbox[1]) * deg_to_m / resolution)
+
+                if width * height > 16000000: # Limit to ~16 million pixels to avoid server errors
+                    raise ValueError(f"Requested image size ({width}x{height}) is too large.")
+
+                params = {
+                    'bbox': f'{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}',
+                    'bboxSR': '4326',
+                    'size': f'{width},{height}',
+                    'imageSR': '4326',
+                    'format': 'tiff',
+                    'pixelType': 'F32',
+                    'noData': -9999,
+                    'interpolation': 'RSP_BilinearInterpolation',
+                    'f': 'image'
+                }
+                
+                response = requests.get(base_url, params=params, timeout=30)
+                response.raise_for_status()
+
+                # Check if the response is actually an image before trying to parse it
+                if 'image' not in response.headers.get('Content-Type', ''):
+                    raise ValueError(f"Server did not return an image. Content-Type: {response.headers.get('Content-Type', 'N/A')}")
+
+                # Read the image data into a rioxarray
+                with rioxarray.open_rasterio(io.BytesIO(response.content)) as rds:
+                    dem_data_attempt = rds.squeeze(drop=True)
                 
                 # Validate the data
                 if dem_data_attempt.ndim < 2 or min(dem_data_attempt.shape) < 2:
@@ -174,13 +224,31 @@ class ElevationLayer(BaseLayer):
                 
                 dem_data = dem_data_attempt
                 used_resolution = resolution
-                print(f"Successfully fetched DEM at {resolution}m resolution")
+                # print(f"Successfully fetched DEM at {resolution}m resolution")
                 break
                 
-            except Exception as e:
-                print(f"Failed to fetch at {resolution}m: {str(e)}")
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 500:
+                    print(f"INFO: Server error (500) at {resolution}m. The server might be overloaded or the request too complex.")
+                else:
+                    print(f"INFO: HTTP error {e.response.status_code} at {resolution}m.")
                 if target_resolution is not None:
-                    raise ValueError(f"Could not fetch DEM at specified resolution of {target_resolution}m")
+                    raise FetchError from e
+                continue
+            except ValueError as e:  # Catches our custom validation errors
+                print(f"INFO: Validation error at {resolution}m: {e}")
+                if target_resolution is not None:
+                    raise FetchError from e
+                continue
+            except requests.exceptions.RequestException as e:  # Catches timeouts, connection errors etc.
+                print(f"INFO: Network error at {resolution}m: {e}")
+                if target_resolution is not None:
+                    raise FetchError from e
+                continue
+            except Exception as e:
+                print(f"INFO: An unexpected error occurred at {resolution}m: {e}")
+                if target_resolution is not None:
+                    raise FetchError from e
                 continue
 
         if dem_data is None:
@@ -217,7 +285,7 @@ class ElevationLayer(BaseLayer):
             "shape": dem_data.shape,
             "nodata_value": dem_data.rio.nodata
         }
-        
+        print(f"Loaded DEM from cache: {filepath}")
         return dem_data, metadata
 
     def get_dem(self, polygon_geom: Polygon, 
@@ -249,153 +317,220 @@ class ElevationLayer(BaseLayer):
         
         return dem_data, metadata
 
-    def get_mosaic_dem(self, polygon_geom, use_cache=True, vertical_exaggeration=1.0):
+    def _load_land_gdf(self):
+        try:
+            gdf = gpd.read_file(self.land_shapefile_path)
+            # Create a unified geometry for faster intersection checks
+            unified_land = gdf.geometry.unary_union
+            # Return a GeoDataFrame with the single unified geometry
+            return gpd.GeoDataFrame(geometry=[unified_land], crs=gdf.crs)
+        except Exception as e:
+            print(f"Warning: Could not load reference land geometry: {e}")
+            return None
+
+    def get_mosaic_dem(self, polygon_geom, use_cache=True, vertical_exaggeration=1.0, state_polygon: Optional[Polygon] = None):
         land_area = bbox_to_land_area(polygon_geom)
-        valid_resolutions = land_area_to_resolution(land_area)  # e.g., [1, 3, 10, 30, 100]
+        valid_resolutions = land_area_to_resolution(land_area)
         minx, miny, maxx, maxy = polygon_geom.bounds
 
-        # Check for cached mosaic
-        mosaic_cache_path, metadata = self._get_cache_filepath(polygon_geom, resolution='mosaic')
+        unavailable_tiles_log = os.path.join(self.cache_dir, "unavailable_tiles.txt")
+        unavailable_bounds = set()
+        if use_cache and os.path.exists(unavailable_tiles_log):
+            with open(unavailable_tiles_log, 'r') as f:
+                for line in f:
+                    try:
+                        bounds_str = line.split(': ')[1].strip()
+                        unavailable_bounds.add(bounds_str)
+                    except (IndexError, ValueError):
+                        continue
+
+        mosaic_cache_path, metadata = self._get_cache_filepath(polygon_geom, resolution='mosaic', is_tile=False)
         if use_cache and os.path.exists(mosaic_cache_path):
             print(f"Loading cached mosaic DEM from {mosaic_cache_path}")
             mosaic = rioxarray.open_rasterio(mosaic_cache_path).squeeze()
             mosaic = mosaic * vertical_exaggeration
-            return mosaic, metadata
+            return mosaic, metadata, None
 
-        # Choose a tile size based on the highest resolution
-        if 1 in valid_resolutions:
-            tile_size = 0.01  # ~1km
-        elif 3 in valid_resolutions:
-            tile_size = 0.03  # ~3km
-        elif 10 in valid_resolutions:
-            tile_size = 0.05  # ~5km
-        elif 30 in valid_resolutions:
-            tile_size = 0.1   # ~10km
+        min_tile_size = 0.005  # Approx 500m, the base case for recursion
+        processed_tiles = []
+
+        if self.land_gdf is not None:
+            land_geom_proj = self.land_gdf.to_crs("EPSG:4326").geometry.iloc[0]
         else:
-            tile_size = 0.25  # fallback
+            land_geom_proj = None
 
-        overlap = 0.01
-        # Generate tiles
-        tiles = []
-        x = minx
-        while x < maxx:
-            y = miny
-            while y < maxy:
-                tile = box(
-                            max(minx, x - overlap),
-                            max(miny, y - overlap),
-                            min(maxx, x + tile_size + overlap),
-                            min(maxy, y + tile_size + overlap)
-                        )
-                tiles.append(tile)
-                y += tile_size
-            x += tile_size
+        def _process_tile(tile_geom, tile_id):
+            if state_polygon and not tile_geom.intersects(state_polygon):
+                print(f"Skipping tile {tile_id} that is outside of the state boundary.")
+                return []
 
-        # Download highest available resolution for each tile
-        tile_dems = []
-        fetched_resolutions = {}
-        metadata = {}
-        for i, tile in enumerate(tiles):
-            dem_data = None
+            tile_bounds = tile_geom.bounds
+            print(f"--- Processing Tile {tile_id} | BBOX: {tile_bounds} ---")
+            
+            if format_bbox_string(tile_bounds) in unavailable_bounds:
+                print(f"Skipping cached unavailable tile {tile_id}")
+                return []
+
+            is_min_size = tile_bounds[2] - tile_bounds[0] < min_tile_size or tile_bounds[3] - tile_bounds[1] < min_tile_size
+            if is_min_size:
+                print(f"DEBUG: Tile {tile_id} is at or below min size, will not be subdivided further.")
+
+            if land_geom_proj and not tile_geom.intersects(land_geom_proj):
+                print(f"Skipping ocean tile {tile_id}")
+                return []
+
             for res in valid_resolutions:
-                if res not in fetched_resolutions:
-                    fetched_resolutions[res] = 0
                 try:
-                    dem_data, metadata = self._fetch_from_source(tile, target_resolution=res)
-                    fetched_resolutions[res] += 1
-                    break
-                except Exception as e:
-                    continue
-            if dem_data is not None:
-                tile_dems.append(dem_data)
-            else:
-                print(f"WARNING: No DEM available for tile {tile.bounds}")
+                    tile_cache_path, _ = self._get_cache_filepath(tile_geom, resolution=res, is_tile=True)
+                    if use_cache and os.path.exists(tile_cache_path):
+                        dem_data, _ = self._load_from_cache(tile_cache_path)
+                    else:
+                        dem_data, _ = self._fetch_from_source(tile_geom, target_resolution=res)
+                    
+                    min_elev, max_elev = np.nanmin(dem_data.values), np.nanmax(dem_data.values)
+                    
+                    # --- Revised check for empty/invalid data ---
+                    nodata_val = dem_data.rio.nodata
+                    data_values = dem_data.values
 
-            print(f"Fetched {i}/{len(tiles)} tiles")
-            print(f"Fetched resolutions: {fetched_resolutions}")
+                    # Start by assuming all data is valid and then mask out invalid pixels
+                    valid_pixels = np.full(data_values.shape, True, dtype=bool)
+                    
+                    # Mask out NaN values
+                    nan_mask = np.isnan(data_values)
+                    valid_pixels[nan_mask] = False
+                    
+                    # Mask out the specific nodata value if it is present
+                    nodata_count = 0
+                    if nodata_val is not None:
+                        # Use np.isclose for robust floating-point comparison
+                        nodata_mask = np.isclose(data_values, nodata_val)
+                        valid_pixels[nodata_mask] = False
+                        nodata_count = np.count_nonzero(nodata_mask)
 
-        # Save each tile to a temporary file
+                    valid_data_ratio = np.count_nonzero(valid_pixels) / data_values.size
+                    nan_count = np.count_nonzero(nan_mask)
+                    zero_count = np.count_nonzero(np.isclose(data_values, 0))
+                    
+                    print(f"DEBUG Tile {tile_id}: nodata_val={nodata_val}, min={min_elev:.2f}, max={max_elev:.2f}, "
+                          f"nan_count={nan_count}, zero_count={zero_count}, nodata_count={nodata_count}, "
+                          f"valid_ratio={valid_data_ratio:.2f}")
+
+                    if valid_data_ratio < 0.98: # If less than 98% of the tile has data
+                        raise ValueError("Tile contains significant no-data areas.")
+
+                    if min_elev is not np.nan and max_elev is not np.nan and (max_elev - min_elev) < 1:
+                        raise ValueError("Tile is flat, contains no significant elevation data.")
+
+                    if not use_cache or not os.path.exists(tile_cache_path):
+                         self._save_to_cache(dem_data, tile_cache_path)
+
+                    print(f"Successfully processed tile {tile_id} ({tile_bounds}) at {res}m resolution.")
+                    return [dem_data]
+
+                except (FetchError, ValueError) as e:
+                    error_str = f"{e} {e.__cause__}"
+                    if not is_min_size and ("too large" in error_str or "flat" in error_str or "500" in error_str or "no-data" in error_str):
+                        print(f"Tile {tile_id} at {res}m failed. Subdividing. Error: {e.__cause__ or e}")
+                        t_minx, t_miny, t_maxx, t_maxy = tile_bounds
+                        midx, midy = (t_minx + t_maxx) / 2, (t_miny + t_maxy) / 2
+                        
+                        child_dems = []
+                        child_dems.extend(_process_tile(box(t_minx, midy, midx, t_maxy), f"{tile_id}.1"))
+                        child_dems.extend(_process_tile(box(midx, midy, t_maxx, t_maxy), f"{tile_id}.2"))
+                        child_dems.extend(_process_tile(box(t_minx, t_miny, midx, midy), f"{tile_id}.3"))
+                        child_dems.extend(_process_tile(box(midx, t_miny, t_maxx, midy), f"{tile_id}.4"))
+                        return child_dems
+                    else:
+                        print(f"INFO: Tile {tile_id} at {res}m failed. Trying next resolution. Error: {e.__cause__ or e}")
+                        continue
+
+            print(f"WARNING: No DEM available for tile {tile_id}. Logging as unavailable.")
+            with open(unavailable_tiles_log, 'a') as f:
+                f.write(f"Tile: {format_bbox_string(tile_bounds)}\n")
+            return []
+
+        # Start with large tiles covering the whole area
+        initial_tile_size = 1.0
+        x_coords = np.arange(minx, maxx, initial_tile_size)
+        y_coords = np.arange(miny, maxy, initial_tile_size)
+        
+        initial_tiles_to_process = []
+        for i, x in enumerate(x_coords):
+            for j, y in enumerate(y_coords):
+                tile_id = f"{i*len(y_coords) + j + 1}"
+                tile_geom = box(x, y, min(x + initial_tile_size, maxx), min(y + initial_tile_size, maxy))
+                initial_tiles_to_process.append({'geom': tile_geom, 'id': tile_id})
+
+        processed_tiles = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_tile = {executor.submit(_process_tile, tile['geom'], tile['id']): tile for tile in initial_tiles_to_process}
+            
+            total_tiles = len(initial_tiles_to_process)
+            for i, future in enumerate(as_completed(future_to_tile)):
+                tile_id = future_to_tile[future]['id']
+                try:
+                    dem_list = future.result()
+                    if dem_list:
+                        processed_tiles.extend(dem_list)
+                    print(f"--- Completed initial tile {tile_id} ({i + 1}/{total_tiles}). Found {len(dem_list)} DEMs. ---")
+                except Exception as exc:
+                    print(f'Initial tile {tile_id} generated an exception: {exc}')
+
+        if not processed_tiles:
+            raise ValueError("Could not fetch any DEM tiles for the given area.")
+            
+        # Check for multiple resolutions and resample to the highest if necessary
+        # to prevent seams in the final output.
+        resolutions = {dem.rio.resolution()[0] for dem in processed_tiles}
+        if len(resolutions) > 1:
+            target_res = min(resolutions)
+            print(f"Found multiple resolutions. Resampling all tiles to highest resolution ({target_res:.8f} degrees) to prevent seams.")
+        else:
+            target_res = None # No resampling needed if all tiles are the same resolution
+
+        # MERGE LOGIC
+        print(f"Stitching {len(processed_tiles)} tiles together...")
         temp_files = []
-        for i, dem in enumerate(tile_dems):
-            temp_file = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
-            dem.rio.to_raster(temp_file.name)
-            temp_files.append(temp_file.name)
+        try:
+            for i, dem in enumerate(processed_tiles):
+                with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_f:
+                    dem.rio.to_raster(temp_f.name)
+                    temp_files.append(temp_f.name)
+            
+            srcs = [rasterio.open(f) for f in temp_files]
+            if target_res:
+                mosaic_arr, out_trans = rio_merge(srcs, method='first', res=target_res)
+            else:
+                mosaic_arr, out_trans = rio_merge(srcs, method='first')
 
-        # Open all tiles as rasterio datasets
-        srcs = [rasterio.open(f) for f in temp_files]
-        mosaic_arr, out_trans = rio_merge(srcs, method='first')
+            for src in srcs:
+                src.close()
+        finally:
+            for f in temp_files:
+                os.remove(f)
 
-        # Debug: Check mosaic array for NaN values
-        print(f"Mosaic array shape: {mosaic_arr.shape}")
-        print(f"Mosaic array dtype: {mosaic_arr.dtype}")
-        print(f"NaN values in mosaic: {np.isnan(mosaic_arr).sum()}")
-        print(f"Min/Max values: {np.nanmin(mosaic_arr):.2f}/{np.nanmax(mosaic_arr):.2f}")
-
-        # Optionally, close files and clean up
-        for src in srcs:
-            src.close()
-        for f in temp_files:
-            os.remove(f)
-
-        # Convert the numpy array back to a DataArray
-        # Use the metadata from the first tile for CRS, etc.
-        first_tile = tile_dems[0]
-        # mosaic_da = rioxarray.open_rasterio(
-        #     rasterio.io.MemoryFile().open(
-        #         driver='GTiff',
-        #         width=mosaic_arr.shape[2],
-        #         height=mosaic_arr.shape[1],
-        #         count=1,
-        #         dtype=mosaic_arr.dtype,
-        #         transform=out_trans,
-        #         crs=first_tile.rio.crs
-        #     )
-        # )
-        # Or, if you want to avoid MemoryFile, you can use rioxarray's from_array:
-        import xarray as xr
-        # mosaic_arr shape: (bands, height, width)
-        height, width = mosaic_arr.shape[1], mosaic_arr.shape[2]
-        transform = out_trans
-
-        # Generate coordinates using the transform
-        x_coords = np.array([transform * (i, 0) for i in range(width)])[:, 0]
-        y_coords = np.array([transform * (0, j) for j in range(height)])[:, 1]
-
-        mosaic_da = xr.DataArray(
-            mosaic_arr[0],  # [0] if single band
+        first_tile = processed_tiles[0]
+        mosaic_da = xarray.DataArray(
+            mosaic_arr[0],
             dims=("y", "x"),
             coords={
-                "y": y_coords,
-                "x": x_coords,
+                "y": (("y",), out_trans.f + np.arange(mosaic_arr.shape[1]) * out_trans.e),
+                "x": (("x",), out_trans.c + np.arange(mosaic_arr.shape[2]) * out_trans.a),
             },
             attrs=first_tile.attrs
-        )
-        mosaic_da = mosaic_da.rio.write_crs(first_tile.rio.crs)
-        mosaic_da = mosaic_da.rio.write_transform(out_trans)
-
-        # Debug: Check DataArray before vertical exaggeration
-        print(f"DataArray shape: {mosaic_da.shape}")
-        print(f"DataArray NaN values: {np.isnan(mosaic_da.values).sum()}")
-        print(f"DataArray Min/Max: {np.nanmin(mosaic_da.values):.2f}/{np.nanmax(mosaic_da.values):.2f}")
-
-        # Apply vertical exaggeration
+        ).rio.write_crs(first_tile.rio.crs).rio.write_transform(out_trans)
+        
+        mosaic_da = mosaic_da.rio.clip_box(minx, miny, maxx, maxy)
         mosaic_da = mosaic_da * vertical_exaggeration
 
-        # Debug: Check after vertical exaggeration
-        print(f"After vertical exaggeration - NaN values: {np.isnan(mosaic_da.values).sum()}")
-
-        # Save the full mosaic to cache
+        print("Saving final mosaic to cache...")
         mosaic_da.rio.to_raster(mosaic_cache_path)
-        print(f"Saved mosaic DEM to {mosaic_cache_path}")
-
-        # After creating mosaic_da
-        mosaic_da = mosaic_da.rio.clip_box(minx, miny, maxx, maxy)
         
-        # Debug: Check after clipping
-        print(f"After clipping - NaN values: {np.isnan(mosaic_da.values).sum()}")
-        print(f"After clipping - Min/Max: {np.nanmin(mosaic_da.values):.2f}/{np.nanmax(mosaic_da.values):.2f}")
-
-        return mosaic_da, metadata
+        # Return the tiles list for potential debugging/visualization if needed
+        initial_tiles = [box(x, y, x + initial_tile_size, y + initial_tile_size) for x in x_coords for y in y_coords]
+        
+        return mosaic_da, metadata, initial_tiles
 
 class WaterLayer(BaseLayer):
     def __init__(self, cache_dir: str, location_name: str = "unnamed"):
@@ -540,20 +675,21 @@ class WaterLayer(BaseLayer):
     def name(self):
         return "water_features"
 
-    def _get_cache_filepath(self, polygon_geom: Polygon) -> str:
+    def _get_cache_filepath(self, polygon_geom: Polygon, min_area_km2: float = 0.0) -> str:
         """Generate cache filepath for water features."""
         bbox = polygon_geom.bounds
         bbox_str = format_bbox_string(bbox)
+        area_str = f"_min_area_{min_area_km2}" if min_area_km2 > 0 else ""
         return os.path.join(
             self.cache_dir,
-            f"{self.name}_{self.location_name}_{bbox_str}.geojson"
+            f"{self.name}_{self.location_name}_{bbox_str}{area_str}.geojson"
         )
 
-    def _fetch_from_source(self, polygon_geom: Polygon) -> gpd.GeoDataFrame:
+    def _fetch_from_source(self, polygon_geom: Polygon, min_area_km2: float = 0.0) -> gpd.GeoDataFrame:
         """
         Fetch water features from NHD.
         """
-        print("Fetching NHD water body data...")
+        print(f"Fetching NHD water body data (min area: {min_area_km2:.2f} km^2)...")
         try:
             bbox = polygon_geom.bounds
             # Layer numbers from NHD MapServer:
@@ -591,13 +727,18 @@ class WaterLayer(BaseLayer):
                 43621,  # Reservoir
             ]
 
-            # Include all water feature types
-            ftype_clause = "FTYPE IN ('SeaOcean', 'Ocean', 'Sea', 'BayInlet', 'StreamRiver', 'Estuary', 'CanalDitch', 'Reservoir', 'LakePond')"
-            #where_clause = f"(FCode IN ({','.join(map(str, include_fcodes))}) OR {ftype_clause})"
-            where_clause = f"FCode IN ({','.join(map(str, include_fcodes))})"
-            encoded_where = quote(where_clause)
+            base_where_clause = f"FCode IN ({','.join(map(str, include_fcodes))})"
             
             for layer in layers:
+                # Add area filter for polygon layers, but not for line layers
+                if layer in [7, 8, 9, 10, 11, 12] and min_area_km2 > 0:
+                    area_clause = f"AreaSqKm >= {min_area_km2}"
+                    where_clause = f"({base_where_clause}) AND ({area_clause})"
+                else:
+                    where_clause = base_where_clause
+                
+                encoded_where = quote(where_clause)
+                
                 nhd_url = (
                     "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/"
                     f"{layer}/query?"
@@ -611,20 +752,15 @@ class WaterLayer(BaseLayer):
                     f"where={encoded_where}"
                 )
                 
-                response = requests.get(nhd_url)
-                if response.status_code == 200:
+                response = requests.get(nhd_url, timeout=60) # Increased timeout for large queries
+                if response.status_code == 200 and response.text:
                     try:
-                        water_features = gpd.read_file(response.text)
+                        water_features = gpd.read_file(io.StringIO(response.text))
                         if not water_features.empty:
-                            # Print the types of features found for debugging
-                            if 'FTYPE' in water_features.columns:
-                                print(f"Layer {layer} feature types: {water_features['FTYPE'].unique()}")
-                            if 'FCODE' in water_features.columns:
-                                print(f"Layer {layer} feature codes: {water_features['FCODE'].unique()}")
                             all_water_features.append(water_features)
                             print(f"Found {len(water_features)} water features in layer {layer}")
                     except Exception as e:
-                        print(f"Error parsing GeoJSON response for layer {layer}: {e}")
+                        print(f"Could not parse GeoJSON for layer {layer}: {e}")
 
             if not all_water_features:
                 return None
@@ -687,7 +823,7 @@ class WaterLayer(BaseLayer):
         return water_mask
 
     def get_water_mask(self, polygon_geom: Polygon, dem_data: xarray.DataArray,
-                      use_cache: bool = True) -> np.ndarray:
+                      use_cache: bool = True, min_area_km2: Optional[float] = None) -> np.ndarray:
         """
         Main method to get water mask.
         
@@ -695,18 +831,137 @@ class WaterLayer(BaseLayer):
             polygon_geom: Shapely Polygon defining the area of interest
             dem_data: DEM data to match dimensions and transform
             use_cache: Whether to use cached data
+            min_area_km2: The minimum area in square kilometers for a water feature to be included.
+                          If None, a default is calculated based on the map size.
             
         Returns:
             numpy.ndarray: Binary mask where True indicates water
         """
-        cache_path = self._get_cache_filepath(polygon_geom)
+        # If no minimum area is specified, calculate a reasonable default
+        # based on the total size of the map area to avoid fetching tiny features.
+        if min_area_km2 is None:
+            total_area_km2 = bbox_to_land_area(polygon_geom) / 1_000_000
+            if total_area_km2 > 10000:  # e.g., large state
+                min_area_km2 = 1.0
+            elif total_area_km2 > 1000: # e.g., large county or small state
+                min_area_km2 = 0.5
+            else:  # For smaller, local maps
+                min_area_km2 = 0.0
+            print(f"INFO: Automatically setting min water feature area to {min_area_km2:.2f} km^2 for this map size.")
+        
+        cache_path = self._get_cache_filepath(polygon_geom, min_area_km2=min_area_km2)
         
         if use_cache and os.path.exists(cache_path):
             print(f"Loading cached water features from {cache_path}")
             water_features = self._load_from_cache(cache_path)
         else:
-            water_features = self._fetch_from_source(polygon_geom)
+            water_features = self._fetch_from_source(polygon_geom, min_area_km2=min_area_km2)
             if water_features is not None:
                 self._save_to_cache(water_features, cache_path)
 
         return self.create_water_mask(water_features, dem_data)
+
+class StateBoundaryLayer(BaseLayer):
+    def __init__(self, cache_dir: str, location_name: str = "unnamed"):
+        super().__init__(cache_dir)
+        self.location_name = location_name
+        self.state_shapefile_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets", "reference_data", "ne_10m_admin_1_states_provinces_lakes.shp"
+        )
+        self.land_shapefile_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets", "reference_data", "ne_50m_land.shp"
+        )
+        self.states_gdf = self._load_states_gdf()
+        self.land_gdf = self._load_land_gdf()
+
+    @property
+    def name(self):
+        return "state_boundary"
+
+    def _get_cache_filepath(self, polygon_geom):
+        # Not used for state boundaries, but required by BaseLayer
+        return os.path.join(self.cache_dir, f"{self.name}_{self.location_name}.geojson")
+
+    def _fetch_from_source(self, polygon_geom):
+        # Not used for state boundaries, but required by BaseLayer
+        return None
+
+    def _save_to_cache(self, data, filepath):
+        # Not used for state boundaries, but required by BaseLayer
+        pass
+
+    def _load_from_cache(self, filepath):
+        # Not used for state boundaries, but required by BaseLayer
+        return None
+
+    def _load_states_gdf(self):
+        try:
+            gdf = gpd.read_file(self.state_shapefile_path)
+            return gdf
+        except Exception as e:
+            print(f"Error loading state boundaries: {e}")
+            return None
+
+    def _load_land_gdf(self):
+        try:
+            gdf = gpd.read_file(self.land_shapefile_path)
+            return gdf
+        except Exception as e:
+            print(f"Error loading land polygons: {e}")
+            return None
+
+    def get_state_polygon(self, state_name: str, country_name: str = "United States of America", land_only: bool = False) -> Polygon:
+        """
+        Get the polygon for a given state (optionally land-only, i.e., clipped to landmass).
+        """
+        if self.states_gdf is None:
+            raise RuntimeError("State boundaries not loaded.")
+        # Try to match by state name and country
+        state_row = self.states_gdf[
+            (self.states_gdf['name'].str.lower() == state_name.lower()) &
+            (self.states_gdf['admin'].str.lower() == country_name.lower())
+        ]
+        if state_row.empty:
+            # Try matching by abbrev
+            state_row = self.states_gdf[
+                (self.states_gdf['abbrev'].str.lower() == state_name.lower()) &
+                (self.states_gdf['admin'].str.lower() == country_name.lower())
+            ]
+        if state_row.empty:
+            raise ValueError(f"State '{state_name}' not found in shapefile.")
+        state_geom = state_row.geometry.iloc[0]
+        if not land_only or self.land_gdf is None:
+            return state_geom
+        # Intersect with land polygon(s)
+        land_union = self.land_gdf.geometry.unary_union
+        clipped = state_geom.intersection(land_union)
+        return clipped
+
+    def create_state_mask(self, state_polygon: Polygon, dem_data: xarray.DataArray) -> np.ndarray:
+        """
+        Create a binary mask for the state polygon on the DEM grid.
+        """
+        # Ensure CRS match
+        from shapely.geometry import mapping
+        import rasterio
+        import rasterio.features
+        # Reproject state polygon to DEM CRS if needed
+        if hasattr(dem_data, 'rio') and hasattr(dem_data.rio, 'crs'):
+            dem_crs = dem_data.rio.crs
+            gdf = gpd.GeoDataFrame(geometry=[state_polygon], crs="EPSG:4326")
+            gdf = gdf.to_crs(dem_crs)
+            poly = gdf.geometry.iloc[0]
+        else:
+            poly = state_polygon
+        out_shape = dem_data.shape[1:] if dem_data.ndim == 3 else dem_data.shape
+        mask = rasterio.features.rasterize(
+            [(poly, 1)],
+            out_shape=out_shape,
+            transform=dem_data.rio.transform(),
+            fill=0,
+            dtype='uint8',
+            all_touched=True
+        ).astype(bool)
+        return mask

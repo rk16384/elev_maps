@@ -58,22 +58,41 @@ def land_area_to_resolution(land_area: float) -> List[int]:
         List[int]: List of valid resolutions in meters, sorted from highest to lowest quality
     """
     # Target pixel area for high-quality visualization (4800x6000 pixels)
-    pixel_area = 4800 * 6000
+    # max print size
+    max_print_size = 24 * 36 # square inches
+    dpi = 600 # high quality print
+    dpsi = dpi * dpi
+    pixel_area = max_print_size * dpsi
 
-    # Calculate minimum pixel size with a 2.5x safety factor
-    minimum_pixel_size = np.sqrt(land_area / pixel_area) / 2
+    # pixel_area = 4800 * 6000
+
+    # Calculate minimum pixel size
+    minimum_pixel_size = np.sqrt(land_area / pixel_area)
 
     # Available resolutions in meters (from highest to lowest quality)
-    valid_search_resolutions = [1, 3, 10, 30, 100]
+    valid_search_resolutions = [100, 30, 10, 3, 1]
+
+    # indices of valid resolutions
+    valid_indices = np.where(np.array(valid_search_resolutions) <= minimum_pixel_size)[0]
+    # Add one more resolution to the list if less than length of valid_indices
+    # if len(valid_indices) < len(valid_search_resolutions):
+    #     valid_indices = np.append(valid_indices, valid_indices[-1] + 1)
 
     # Return all resolutions that are greater than or equal to the minimum pixel size
-    valid_resolutions = [x for x in valid_search_resolutions if x >= minimum_pixel_size]
+    valid_resolutions = np.array(valid_search_resolutions)[valid_indices]
+
+    invalid_resolutions = np.array(valid_search_resolutions)[~valid_indices]
+    rev_invalid_resolutions = invalid_resolutions[::-1]
+    # Add the invalid resolutions in reverse to the end of the valid resolutions
+    # This is for worst case scenario where the ideal resolutions are invalid
+    valid_resolutions = np.concatenate((valid_resolutions, rev_invalid_resolutions))
+    
     
     # If no valid resolutions found, return the highest available resolution
-    if not valid_resolutions:
-        return [valid_search_resolutions[-1]]
-    
-    return valid_resolutions
+    if len(valid_resolutions) == 0:
+        return [valid_search_resolutions[0]]
+    else:
+        return valid_resolutions
 
 def reproject_to_web_mercator(dem_data: xarray.DataArray) -> xarray.DataArray:
     """Reproject DEM data to Web Mercator (EPSG:3857) if needed."""
@@ -99,8 +118,10 @@ def create_extrusion_shadow(
     light_azimuth: float = 0.0, # 0 North, 90 East, 180 South, 270 West
     scale: float = .1,
     shadow_color: tuple = (120, 120, 120, 178), # RGBA Gray
-    downsample_factor: int = 4,
-    blur_radius: float = 5.0
+    downsample_factor: int = 16,
+    blur_radius: float = 5.0,
+    transparent_background: bool = False,
+    state_mask: Optional[np.ndarray] = None
 ) -> Tuple[Image.Image, Tuple[int, int]]:
     """
     Generates an extrusion shadow effect for a Digital Elevation Model (DEM).
@@ -120,7 +141,8 @@ def create_extrusion_shadow(
         downsample_factor (int): Factor to downsample the DEM for performance.
             A factor of 4 reduces the image to 1/4 of its width and height.
         blur_radius (float): The radius for the Gaussian blur applied to the shadow.
-
+        transparent_background (bool): Whether to use a transparent background.
+        state_mask (np.ndarray): A mask of the state to be used for the background.
     Returns:
         tuple[Image.Image, tuple[int, int]]: A tuple containing:
             - An RGB image with the shadow on a white background.
@@ -129,7 +151,8 @@ def create_extrusion_shadow(
     # Get the raw numpy data, removing any single-dimensional entries
     dem_numpy = dem_data.data.squeeze()
 
-    dem_numpy = dem_numpy + 800
+    z_bump = 800
+    dem_numpy = dem_numpy + z_bump
 
     if downsample_factor < 1:
         downsample_factor = 1
@@ -210,7 +233,11 @@ def create_extrusion_shadow(
 
     for y, x in all_coords:
         z = dem_data_scaled[y, x]
+        if z is np.nan:
+            continue
         if z <= 0:
+            continue
+        if state_mask is not None and state_mask[y, x] == 1:
             continue
         if z.item() is np.nan:
             z = 0
@@ -240,10 +267,24 @@ def create_extrusion_shadow(
     # Create a mask for the DEM footprint to punch a hole in the shadow
     dem_mask = Image.new('L', (canvas_width, canvas_height), 255)
     draw_mask = ImageDraw.Draw(dem_mask)
-    draw_mask.rectangle(
-        (dem_offset_x, dem_offset_y, dem_offset_x + dem_width - 1, dem_offset_y + dem_height - 1),
-        fill=0  # 0 makes this area transparent in the final alpha
-    )
+
+    if state_mask is not None:
+        # If a state mask is provided, create a hole in the shape of the state
+        mask_image = Image.fromarray((state_mask * 255).astype(np.uint8), 'L')
+        if downsample_factor > 1:
+            mask_image = mask_image.resize((dem_width, dem_height), Image.Resampling.NEAREST)
+        
+        # Invert the mask: we want the state area to be the hole (0)
+        inverted_mask = Image.eval(mask_image, lambda x: 255 - x)
+        
+        # Paste the shaped hole into the main dem_mask
+        dem_mask.paste(inverted_mask, (dem_offset_x, dem_offset_y))
+    else:
+        # Original behavior: punch a rectangular hole
+        draw_mask.rectangle(
+            (dem_offset_x, dem_offset_y, dem_offset_x + dem_width - 1, dem_offset_y + dem_height - 1),
+            fill=0  # 0 makes this area transparent in the final alpha
+        )
 
     # Combine the blurred shadow alpha with the DEM mask
     final_alpha = ImageChops.darker(shadow_alpha, dem_mask)
