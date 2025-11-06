@@ -2,7 +2,7 @@ import numpy as np
 from typing import Tuple, Optional, List, Union
 import xarray
 import pyproj
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import transform
 from functools import partial
 import numpy as np
@@ -12,17 +12,17 @@ import geopandas as gpd
 import shapely
 
 
-def bbox_to_land_area(polygon_or_bbox: Union[Tuple[float, float, float, float], Polygon]) -> float:
+def bbox_to_land_area(polygon_or_bbox: Union[Tuple[float, float, float, float], Polygon, MultiPolygon]) -> float:
     """
     Calculate the land area of a bounding box or polygon in square meters.
 
     Args:
-        polygon_or_bbox: Either a shapely Polygon or a (west, south, east, north) tuple
+        polygon_or_bbox: Either a shapely Polygon, MultiPolygon, or a (west, south, east, north) tuple
 
     Returns:
         float: The area in square meters
     """
-    if isinstance(polygon_or_bbox, Polygon):
+    if isinstance(polygon_or_bbox, (Polygon, MultiPolygon)):
         polygon_wgs84 = polygon_or_bbox
     else:
         # Assume (west, south, east, north) tuple
@@ -60,7 +60,7 @@ def land_area_to_resolution(land_area: float) -> List[int]:
     # Target pixel area for high-quality visualization (4800x6000 pixels)
     # max print size
     max_print_size = 24 * 36 # square inches
-    dpi = 600 # high quality print
+    dpi = 400 # high quality print
     dpsi = dpi * dpi
     pixel_area = max_print_size * dpsi
 
@@ -72,16 +72,14 @@ def land_area_to_resolution(land_area: float) -> List[int]:
     # Available resolutions in meters (from highest to lowest quality)
     valid_search_resolutions = [100, 30, 10, 3, 1]
 
-    # indices of valid resolutions
-    valid_indices = np.where(np.array(valid_search_resolutions) <= minimum_pixel_size)[0]
-    # Add one more resolution to the list if less than length of valid_indices
-    # if len(valid_indices) < len(valid_search_resolutions):
-    #     valid_indices = np.append(valid_indices, valid_indices[-1] + 1)
-
-    # Return all resolutions that are greater than or equal to the minimum pixel size
-    valid_resolutions = np.array(valid_search_resolutions)[valid_indices]
-
-    invalid_resolutions = np.array(valid_search_resolutions)[~valid_indices]
+    # Create boolean mask for valid resolutions
+    valid_mask = np.array(valid_search_resolutions) <= minimum_pixel_size
+    
+    # Get valid resolutions
+    valid_resolutions = np.array(valid_search_resolutions)[valid_mask]
+    
+    # Get invalid resolutions (those NOT in valid_mask)
+    invalid_resolutions = np.array(valid_search_resolutions)[~valid_mask]
     rev_invalid_resolutions = invalid_resolutions[::-1]
     # Add the invalid resolutions in reverse to the end of the valid resolutions
     # This is for worst case scenario where the ideal resolutions are invalid
@@ -121,7 +119,8 @@ def create_extrusion_shadow(
     downsample_factor: int = 16,
     blur_radius: float = 5.0,
     transparent_background: bool = False,
-    state_mask: Optional[np.ndarray] = None
+    state_mask: Optional[np.ndarray] = None,
+    print_margin_pixels: int = 5
 ) -> Tuple[Image.Image, Tuple[int, int]]:
     """
     Generates an extrusion shadow effect for a Digital Elevation Model (DEM).
@@ -143,6 +142,7 @@ def create_extrusion_shadow(
         blur_radius (float): The radius for the Gaussian blur applied to the shadow.
         transparent_background (bool): Whether to use a transparent background.
         state_mask (np.ndarray): A mask of the state to be used for the background.
+        print_margin_pixels (int): The gap in pixels between the hillshade image and the edge of the final printable area.
     Returns:
         tuple[Image.Image, tuple[int, int]]: A tuple containing:
             - An RGB image with the shadow on a white background.
@@ -194,22 +194,27 @@ def create_extrusion_shadow(
         max_z = np.nanmax(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[0, :]))) # right and top
     elif phi_deg >= 0 and phi_deg < 90:
         max_z = np.nanmax(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[-1, :]))) # right and bottom
-    
+
+    if max_z is np.nan:
+        max_z = np.nanmax(dem_data_scaled)
 
     max_shadow_len = (max_z * scale) / tan_theta
 
-    width_buffer = dem_width * 0.1
+    width_buffer = dem_width * 0.03
     if max_z > 0:
         scale = width_buffer * tan_theta / max_z * 1
     else:
         scale = 0 # Avoid division by zero if map is flat
 
     # Calculate padding and final canvas size
-    padding = math.ceil(width_buffer) + 5
-    canvas_width = dem_width + padding * 2
-    canvas_height = dem_height + padding * 2
-    dem_offset_x = padding
-    dem_offset_y = padding
+    # Ensure we have enough space for the print margin plus shadow padding
+    shadow_padding = math.ceil(width_buffer) + 2
+    total_padding = max(shadow_padding, print_margin_pixels)
+    
+    canvas_width = dem_width + total_padding * 2
+    canvas_height = dem_height + total_padding * 2
+    dem_offset_x = total_padding
+    dem_offset_y = total_padding
 
     # Create the output image, fully transparent initially
     output_image = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
@@ -238,7 +243,7 @@ def create_extrusion_shadow(
         if z <= 0:
             continue
         if state_mask is not None and state_mask[y, x] == 1:
-            continue
+            pass
         if z.item() is np.nan:
             z = 0
 

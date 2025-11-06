@@ -489,38 +489,83 @@ class ElevationLayer(BaseLayer):
         else:
             target_res = None # No resampling needed if all tiles are the same resolution
 
-        # MERGE LOGIC
-        print(f"Stitching {len(processed_tiles)} tiles together...")
-        temp_files = []
-        try:
-            for i, dem in enumerate(processed_tiles):
-                with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_f:
-                    dem.rio.to_raster(temp_f.name)
-                    temp_files.append(temp_f.name)
-            
-            srcs = [rasterio.open(f) for f in temp_files]
-            if target_res:
-                mosaic_arr, out_trans = rio_merge(srcs, method='first', res=target_res)
-            else:
-                mosaic_arr, out_trans = rio_merge(srcs, method='first')
-
-            for src in srcs:
-                src.close()
-        finally:
-            for f in temp_files:
-                os.remove(f)
-
-        first_tile = processed_tiles[0]
-        mosaic_da = xarray.DataArray(
-            mosaic_arr[0],
-            dims=("y", "x"),
-            coords={
-                "y": (("y",), out_trans.f + np.arange(mosaic_arr.shape[1]) * out_trans.e),
-                "x": (("x",), out_trans.c + np.arange(mosaic_arr.shape[2]) * out_trans.a),
-            },
-            attrs=first_tile.attrs
-        ).rio.write_crs(first_tile.rio.crs).rio.write_transform(out_trans)
+        # MERGE LOGIC - Progressive merge for large numbers of tiles
+        print(f"Stitching {len(processed_tiles)} tiles together using progressive merge...")
         
+        def merge_tiles_batch(tiles_batch, target_res=None):
+            """Merge a batch of tiles together"""
+            if len(tiles_batch) == 1:
+                return tiles_batch[0]
+            
+            temp_files = []
+            try:
+                # Create temporary files for this batch
+                for i, dem in enumerate(tiles_batch):
+                    with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as temp_f:
+                        dem.rio.to_raster(temp_f.name)
+                        temp_files.append(temp_f.name)
+                
+                # Open and merge the batch
+                srcs = [rasterio.open(f) for f in temp_files]
+                if target_res:
+                    mosaic_arr, out_trans = rio_merge(srcs, method='first', res=target_res)
+                else:
+                    mosaic_arr, out_trans = rio_merge(srcs, method='first')
+                
+                # Close sources
+                for src in srcs:
+                    src.close()
+                
+                # Convert back to xarray DataArray
+                first_tile = tiles_batch[0]
+                merged_da = xarray.DataArray(
+                    mosaic_arr[0],
+                    dims=("y", "x"),
+                    coords={
+                        "y": (("y",), out_trans.f + np.arange(mosaic_arr.shape[1]) * out_trans.e),
+                        "x": (("x",), out_trans.c + np.arange(mosaic_arr.shape[2]) * out_trans.a),
+                    },
+                    attrs=first_tile.attrs
+                ).rio.write_crs(first_tile.rio.crs).rio.write_transform(out_trans)
+                
+                return merged_da
+                
+            finally:
+                # Clean up temporary files
+                for f in temp_files:
+                    try:
+                        os.remove(f)
+                    except Exception as e:
+                        print(f"Warning: Could not remove temporary file {f}: {e}")
+        
+        # Progressive merge strategy
+        batch_size = 6  # Merge 10 tiles at a time
+        current_tiles = processed_tiles.copy()
+        batch_num = 1
+        
+        while len(current_tiles) > 1:
+            print(f"Batch {batch_num}: Merging {len(current_tiles)} tiles in batches of {batch_size}...")
+            
+            # Split into batches
+            batches = [current_tiles[i:i + batch_size] for i in range(0, len(current_tiles), batch_size)]
+            merged_batches = []
+            
+            for i, batch in enumerate(batches):
+                print(f"  Processing batch {i+1}/{len(batches)} ({len(batch)} tiles)...")
+                merged_batch = merge_tiles_batch(batch, target_res)
+                merged_batches.append(merged_batch)
+            
+            current_tiles = merged_batches
+            batch_num += 1
+        
+        # Final result should be a single merged tile
+        if len(current_tiles) == 1:
+            mosaic_da = current_tiles[0]
+            print("Progressive merge completed successfully!")
+        else:
+            raise ValueError("Progressive merge failed - no tiles remaining")
+        
+        # Clip to the original bounding box and apply vertical exaggeration
         mosaic_da = mosaic_da.rio.clip_box(minx, miny, maxx, maxy)
         mosaic_da = mosaic_da * vertical_exaggeration
 
@@ -699,6 +744,7 @@ class WaterLayer(BaseLayer):
             # 4,5,6: Flowline - Small/Large Scale (rivers/streams)
             # 7,8,9: Area - Small/Large Scale
             layers = [10, 11, 12, 4, 5, 6, 7, 8, 9]
+            layers = [10, 11, 12] # for
             all_water_features = []
             
             # FCodes for water features
@@ -714,17 +760,28 @@ class WaterLayer(BaseLayer):
                 39009,  # Lake/Pond - Average water elevation
                 39010,  # Lake/Pond - Normal pool
                 # Rivers and Streams
-                46006,  # StreamRiver - Perennial
-                46003,  # StreamRiver - Intermittent
+                #46006,  # StreamRiver - Perennial
+                #46003,  # StreamRiver - Intermittent
                 # Coastal Features
                 31200,  # BayInlet
-                49300,  # Estuary
+                #49300,  # Estuary
                 36400,  # Foreshore
                 56600,  # Coastline
                 # Reservoirs
                 43615,  # Reservoir - Perennial
                 43617,  # Reservoir
                 43621,  # Reservoir
+            ]
+
+            # Remove coastal features that extend beyond state boundaries
+            exclude_fcodes = [
+                36400,  # Foreshore - often extends beyond boundaries
+                56600,  # Coastline - often extends beyond boundaries
+                44500,  # SeaOcean - the Great Lakes themselves
+                44501,  # Sea/Ocean - Atlantic
+                44502,  # Sea/Ocean - Pacific
+                44503,  # Sea/Ocean - Arctic
+                44504,  # Sea/Ocean - Indian
             ]
 
             base_where_clause = f"FCode IN ({','.join(map(str, include_fcodes))})"
@@ -767,6 +824,10 @@ class WaterLayer(BaseLayer):
 
             water_bodies_gdf = pd.concat(all_water_features, ignore_index=True)
             print(f"Total water features found: {len(water_bodies_gdf)}")
+
+            # Filter out these FCodes
+            if 'FCODE' in water_bodies_gdf.columns:
+                water_bodies_gdf = water_bodies_gdf[~water_bodies_gdf['FCODE'].isin(exclude_fcodes)]
             
             return water_bodies_gdf
 
@@ -822,17 +883,96 @@ class WaterLayer(BaseLayer):
 
         return water_mask
 
-    def get_water_mask(self, polygon_geom: Polygon, dem_data: xarray.DataArray,
-                      use_cache: bool = True, min_area_km2: Optional[float] = None) -> np.ndarray:
+    def _filter_water_features(self, water_features: gpd.GeoDataFrame, state_polygon: Polygon, 
+                              filter_config: dict) -> gpd.GeoDataFrame:
         """
-        Main method to get water mask.
+        Filter water features to remove coastal water and large bodies.
+        
+        Args:
+            water_features: GeoDataFrame of water features
+            state_polygon: State boundary polygon
+            filter_config: Configuration for filtering parameters
+            
+        Returns:
+            Filtered GeoDataFrame of water features
+        """
+        if water_features is None or water_features.empty:
+            return water_features
+        
+        print(f"Filtering {len(water_features)} water features...")
+        
+        # Get filtering parameters
+        coastline_buffer = filter_config.get('coastline_buffer_degrees', 0.002)
+        max_water_area_km2 = filter_config.get('max_water_area_km2', 1000.0)
+        remove_large_bodies = filter_config.get('remove_large_bodies', True)
+        preserve_rivers = filter_config.get('preserve_rivers', True)
+        river_max_width_km = filter_config.get('river_max_width_km', 2.0)
+        
+        # Step 1: Create inland boundary by buffering from coastline
+        inland_boundary = state_polygon.buffer(-coastline_buffer)
+        print(f"Created inland boundary with {coastline_buffer} degree buffer")
+        
+        # Step 2: Filter by area and location
+        filtered_features = []
+        
+        for idx, feature in water_features.iterrows():
+            # Calculate feature area in square kilometers
+            # Convert from degrees to km (approximate: 1 degree ≈ 111 km)
+            feature_area_km2 = feature.geometry.area * (111.32 ** 2)
+            
+            # Check if feature is within inland boundary
+            is_inland = inland_boundary.contains(feature.geometry) or inland_boundary.intersects(feature.geometry)
+            
+            # Determine if this is likely a river (narrow feature)
+            bounds = feature.geometry.bounds
+            width_km = (bounds[2] - bounds[0]) * 111.32  # longitude difference
+            height_km = (bounds[3] - bounds[1]) * 111.32  # latitude difference
+            is_likely_river = max(width_km, height_km) / min(width_km, height_km) > 3  # aspect ratio > 3:1
+            
+            # Apply filtering rules
+            keep_feature = True
+            
+            # Rule 1: Remove large bodies of water
+            if remove_large_bodies and feature_area_km2 > max_water_area_km2:
+                if not (preserve_rivers and is_likely_river):
+                    keep_feature = False
+                    print(f"Removed large water body: {feature_area_km2:.1f} km²")
+            
+            # Rule 2: Remove features that are primarily coastal
+            if not is_inland and feature_area_km2 > 10:  # Only remove larger coastal features
+                keep_feature = False
+                print(f"Removed coastal water feature: {feature_area_km2:.1f} km²")
+            
+            # Rule 3: Preserve rivers even if they're large
+            if preserve_rivers and is_likely_river and max(width_km, height_km) < river_max_width_km:
+                keep_feature = True
+                #print(f"Preserved river: {feature_area_km2:.1f} km²")
+            
+            if keep_feature:
+                filtered_features.append(feature)
+        
+        if filtered_features:
+            filtered_gdf = gpd.GeoDataFrame(filtered_features, crs=water_features.crs)
+            print(f"Filtered water features: {len(water_features)} → {len(filtered_gdf)}")
+            return filtered_gdf
+        else:
+            print("No water features remaining after filtering")
+            return gpd.GeoDataFrame(columns=water_features.columns, crs=water_features.crs)
+
+    def get_water_mask(self, polygon_geom: Polygon, dem_data: xarray.DataArray,
+                      use_cache: bool = True, min_area_km2: Optional[float] = None,
+                      state_polygon: Optional[Polygon] = None, 
+                      water_filter_config: Optional[dict] = None) -> np.ndarray:
+        """
+        Main method to get water mask with configurable filtering.
         
         Args:
             polygon_geom: Shapely Polygon defining the area of interest
             dem_data: DEM data to match dimensions and transform
             use_cache: Whether to use cached data
             min_area_km2: The minimum area in square kilometers for a water feature to be included.
-                          If None, a default is calculated based on the map size.
+            state_polygon: State boundary polygon for filtering
+            water_filter_config: Configuration for water filtering
             
         Returns:
             numpy.ndarray: Binary mask where True indicates water
@@ -858,6 +998,15 @@ class WaterLayer(BaseLayer):
             water_features = self._fetch_from_source(polygon_geom, min_area_km2=min_area_km2)
             if water_features is not None:
                 self._save_to_cache(water_features, cache_path)
+
+        # After getting water features but before rasterizing
+        if state_polygon is not None and water_filter_config is not None:
+            # Apply advanced filtering
+            water_features = self._filter_water_features(water_features, state_polygon, water_filter_config)
+        elif state_polygon is not None:
+            # Simple clipping (original behavior)
+            water_features = water_features.clip(state_polygon)
+            print(f"Water features after clipping to state boundary: {len(water_features)}")
 
         return self.create_water_mask(water_features, dem_data)
 

@@ -1,0 +1,211 @@
+{ 
+    "default": {
+        "common": {
+            "transparent_background": true,
+            "water_color": [2, 6, 83],
+            "gaussian_blur_sigma": 0.0
+        },
+        "shadow_config": {
+            "light_elevation_deg": 89.4,
+            "light_azimuth": 315,
+            "scale": 0.2,
+            "transparent_background": true
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 7.0,
+            "sun_azimuth": 315,
+            "sun_altitude": 30,
+            "include_water": true,
+            "water_color": [2, 6, 83],
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "elevation_coloring_config": {
+            "low_color": [0, 0, 255],
+            "high_color": [255, 239, 160],
+            "use_percentiles": true,
+            "percentile_range": [0.0001, 99],
+            "color_method": "gradient",
+            "water_color": [2, 6, 83]
+        },
+        "cache": {
+            "dem": false,
+            "state_boundary": false,
+            "hillshade": false,
+            "elevation_coloring": true,
+            "water": true,
+            "shadow": true
+        }
+    },
+    "Oregon": {
+        "type": "state",
+        "common": {
+            "transparent_background": true,
+            "do_hillshade": true,
+            "do_elevation_coloring": true
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 7.0,
+            "sun_azimuth": 315,
+            "sun_altitude": 70,
+            "include_water": true,
+            "water_color": [0, 105, 105], 
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "elevation_coloring_config": {
+            "low_color": [0, 0, 255],
+            "high_color": [255, 239, 160],
+            "use_percentiles": true,
+            "percentile_range": [0.0001, 99],
+            "color_method": "gradient",
+            "water_color": [2, 6, 83],
+            "gaussian_blur_sigma": 0.0,
+            "vertical_exaggeration": 7.0
+        }
+    },
+    "Michigan": {
+        "type": "state",
+        "common": {
+            "transparent_background": true,
+            "do_hillshade": true,
+            "do_elevation_coloring": false
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 50,
+            "sun_azimuth": 315,
+            "sun_altitude": 70,
+            "include_water": true,
+            "water_color": [0, 105, 105],
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "water_filter_config": {
+            "coastline_buffer_degrees": 0.002,
+            "max_water_area_km2": 1000.0,
+            "remove_large_bodies": true,
+            "preserve_rivers": true,
+            "river_max_width_km": 2.0
+        },
+        "elevation_coloring_config": {
+            "low_color": [0, 0, 255],
+            "high_color": [255, 239, 160],
+            "use_percentiles": true,
+            "percentile_range": [0.0001, 99],
+            "color_method": "gradient",
+            "water_color": [2, 6, 83],
+            "gaussian_blur_sigma": 0.0,
+            "vertical_exaggeration": 15.0
+        },
+        "cache": {
+            "dem": true,
+            "state_boundary": true,
+            "hillshade": false,
+            "elevation_coloring": true,
+            "water": true,
+            "shadow": true
+        }
+    },
+    "Utah": {
+        "type": "state",
+        "common": {
+            "transparent_background": true,
+            "do_hillshade": true,
+            "do_elevation_coloring": true
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 7.0,
+            "sun_azimuth": 315,
+            "sun_altitude": 70,
+            "include_water": true,
+            "water_color": [0, 105, 105], 
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "elevation_coloring_config": {
+            "low_color": [0, 0, 255],
+            "high_color": [255, 239, 160],
+            "use_percentiles": true,
+            "percentile_range": [0.0001, 99],
+            "color_method": "gradient",
+            "water_color": [2, 6, 83],
+            "gaussian_blur_sigma": 0.0,
+            "vertical_exaggeration": 7.0
+        },
+        "cache": {
+            "dem": true,
+            "state_boundary": true,
+            "hillshade": true,
+            "elevation_coloring": false,
+            "water": true,
+            "shadow": false
+        }
+    },
+    "Astoria": {
+        "type": "coordinates",
+        "coordinates": [
+            [46.394496, -124.094430],
+            [46.394496, -123.414352],
+            [45.725537, -123.414352],
+            [45.725537, -124.094430],
+            [46.394496, -124.094430]
+        ]
+    },
+    "St. George Marathon": {
+        "type": "coordinates",
+        "coordinates": [
+            [37.438083, -113.826296],
+            [37.438083, -113.469845],
+            [37.072886, -113.469845],
+            [37.072886, -113.826296],
+            [37.438083, -113.826296]
+        ],
+        "common": {
+            "transparent_background": true,
+            "do_hillshade": true,
+            "do_elevation_coloring": false
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 12.0,
+            "sun_azimuth": 315,
+            "sun_altitude": 80,
+            "include_water": false,
+            "water_color": 70,
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "cache": {
+            "dem": true,
+            "state_boundary": true,
+            "hillshade": false,
+            "elevation_coloring": true,
+            "water": true,
+            "shadow": true
+        }
+    },
+    "Mt Hood": {
+        "type": "center_point",
+        "center_point": [45.370707, -121.698453],
+        "radius": 3
+    },
+    "Mt Rainer": {
+        "type": "center_point",
+        "center_point": [46.852752, -121.758355],
+        "radius": 3
+    },
+    "Mt St Helens": {
+        "type": "center_point",
+        "center_point": [46.201111, -122.185000],
+        "radius": 3
+    },
+    "Mt Adams": {
+        "type": "center_point",
+        "center_point": [46.205169, -121.493880],
+        "radius": 3
+    },
+    "Mt Jefferson": {
+        "type": "center_point",
+        "center_point": [44.673895, -121.799436],
+        "radius": 3
+    }
+}
