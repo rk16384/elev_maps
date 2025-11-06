@@ -12,3 +12,12 @@ __pycache__/
 # Exceptions - add specific files you want to keep despite matching above patterns
 !README.md
 !requirements.txt maps/output/*.tif
+*.pkl
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.pdf
+data_cache/
+output/
