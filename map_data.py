@@ -49,6 +49,7 @@ class MapData:
 
     # Output settings
     output_dir: str = 'output'
+    base_dir: Optional[str] = None
     use_cache: bool = True
     create_debug_grid: bool = False
     transparent_background: bool = False
@@ -96,13 +97,17 @@ class MapData:
 
     def __post_init__(self):
         """Load data from location config"""
+        # determine base directory for caches/outputs
+        self.base_dir = self.base_dir or os.getenv("ELEV_MAPS_BASE_DIR") or os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = os.path.abspath(self.base_dir)
+
         # load location config
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'location_configs.json'), 'r') as f:
             location_configs = json.load(f)
         self.location_config = location_configs[self.location_name]
 
         self._prepare_geometry()
-        self.cache_dir()
+        self._init_cache_dir()
         self.location_type = self.location_config['type']
         # Shadow config
         if "shadow_config" in self.location_config:
@@ -169,14 +174,15 @@ class MapData:
 
     def make_output_dir(self):
         """Create the output directory if it doesn't exist."""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.output_dir = os.path.join(base_dir, self.output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
+        output_root = os.path.join(self.base_dir, self.output_dir)
+        os.makedirs(output_root, exist_ok=True)
+        self.output_dir = output_root
 
-    def cache_dir(self) -> str:
+    def _init_cache_dir(self) -> None:
         """Generate the path for the cache directory."""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_path = os.path.join(base_dir, "data_cache", self.location_name)
+        cache_root = os.path.join(self.base_dir, "data_cache")
+        os.makedirs(cache_root, exist_ok=True)
+        cache_path = os.path.join(cache_root, self.location_name)
         os.makedirs(cache_path, exist_ok=True)
         self.cache_dir = cache_path
 
@@ -296,7 +302,8 @@ class MapData:
         Get the state polygon, bounding box, and (optionally) a mask for a DEM.
         If dem_data is provided, returns the mask as well.
         """
-        state_layer = StateBoundaryLayer(cache_dir="data_cache", location_name=self.location_name.lower())
+        cache_root = os.path.join(self.base_dir, "data_cache")
+        state_layer = StateBoundaryLayer(cache_dir=cache_root, location_name=self.location_name.lower())
         state_polygon = state_layer.get_state_polygon(self.location_name, land_only=land_only)
         bbox = state_polygon.bounds
 

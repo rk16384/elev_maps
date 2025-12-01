@@ -10,6 +10,10 @@ from PIL import Image, ImageDraw, ImageFilter, ImageChops
 import math
 import geopandas as gpd
 import shapely
+import rasterio
+import pyvista as pv
+import numpy as np
+import cv2
 
 
 def bbox_to_land_area(polygon_or_bbox: Union[Tuple[float, float, float, float], Polygon, MultiPolygon]) -> float:
@@ -420,3 +424,191 @@ def _convert_coastline_to_polygon(self, coastline_features: gpd.GeoDataFrame, bb
         import traceback
         traceback.print_exc()
         return coastline_features
+
+
+def create_ray_traced_hillshade(dem_data: xarray.DataArray):
+
+    diffuse = 0.95 # [0, 1.0] more light/shadow contrast vs flatter
+    ambient = 0.30 # [0, 1.0] base illumination, higher - shadows are lighter, lower - shadows are darker
+    total_intensity = 1.5 # higher, brighter image
+    num_lights = 8 # 5-8 is usually enough for static images
+    spread_angle = 0.015 # Angle in radians (Sun is ~0.009, use 0.02-0.05 for visible softness)
+    base_dir = np.array([-1, 0.3, 2]) # vector in direction of the sun
+
+    # sun altitude
+    norm = np.linalg.norm(base_dir)
+    arctan = np.arctan(base_dir[2] / norm)
+    sun_altitude = np.rad2deg(arctan)
+    print(f"Sun altitude: {sun_altitude}")
+
+    scaling_factor = 1
+    dem_numpy = dem_data.data.squeeze()
+
+    max_pixels = 24 * 30 * 300 * 300
+    dem_height, dem_width = dem_numpy.shape
+    dem_pixels = dem_width * dem_height
+
+    scaling = math.sqrt(max_pixels / dem_pixels)
+    
+    new_width = int(dem_width * scaling)
+    new_height = int(dem_height * scaling)
+    
+    #elevation2 = check_dem.data[::scaling_factor, ::scaling_factor].data
+    #e2_h, e2_w = elevation2.shape
+    #replace nan with -9999
+    dem_numpy = np.where(np.isnan(dem_numpy), -9999, dem_numpy)
+    #reshape elevation to match elevation2 shape
+    print(f"dem_numpy shape: {dem_numpy.shape}")
+    #print(f"elevation2 shape: {elevation2.shape}")
+    
+    #dem_numpy = cv2.resize(dem_numpy, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+    dem_numpy = dem_numpy * 1
+
+    # After resize, shape is (e2_h, e2_w)
+    rows, cols = dem_numpy.shape
+    
+    #dem_numpy_data = dem_numpy.astype(np.float32)
+    grid = pv.ImageData()
+    
+    # CORRECT: VTK (x, y, z) = (cols, rows, depth)
+    grid.dimensions = (cols, rows, 1)
+    
+    grid.point_data["Elevation"] = np.flipud(dem_numpy).flatten()
+    warped = grid.warp_by_scalar("Elevation")
+
+    # --- 3. SETUP THE RENDERER (OFF-SCREEN) ---
+    # off_screen=True prevents the window from popping up
+    plotter = pv.Plotter(off_screen=True, lighting=None)
+
+    # CRITICAL: Add the mesh back to the scene!
+    plotter.add_mesh(
+        warped,
+        color="#FFFFFF",
+        smooth_shading=True,
+        show_scalar_bar=False,
+        diffuse=diffuse, # [0, 1.0] more light/shadow contrast vs flatter
+        ambient=ambient, # [0, 1.0] base illumination, higher - shadows are lighter, lower - shadows are darker
+    )
+
+    # --- 4. LIGHTING (Soft Shadows via Multi-Light) ---
+    # Configuration for the sun
+    # Direction (-1, 0.4, 1)
+    
+    # Normalize direction
+    base_dir = base_dir / np.linalg.norm(base_dir)
+
+    # Center Camera on Mesh Center
+    center_x = (cols - 1) / 2.0
+    center_y = (rows - 1) / 2.0
+    center_z = dem_numpy.max() * 2 + 1000
+    
+    # Distance must be outside the mesh!
+    mesh_center = np.array([center_x, center_y, 0])
+    light_dist = warped.length * 1000
+    base_pos = mesh_center + base_dir * light_dist
+    
+    # Create a local coordinate system to offset perpendicular to light direction
+    # Arbitrary vector not parallel to base_dir
+    up = np.array([0, 0, 1]) if abs(base_dir[2]) < 0.9 else np.array([0, 1, 0])
+    right = np.cross(base_dir, up)
+    right /= np.linalg.norm(right)
+    up = np.cross(right, base_dir)
+    
+    # Offsets in a circle pattern
+    offsets = [(0,0)] # Center light
+    for i in range(num_lights - 1):
+        angle = (2 * np.pi * i) / (num_lights - 1)
+        # Radius is roughly tan(spread_angle) * light_dist
+        radius = np.tan(spread_angle) * light_dist
+        
+        off_vec = right * np.cos(angle) * radius + up * np.sin(angle) * radius
+        
+        # Create light at slightly offset position
+        pos = base_pos + off_vec
+        
+        light = pv.Light(
+            position=pos,
+            focal_point=(center_x, center_y, 0),
+            color='white',
+            intensity=total_intensity / num_lights
+        )
+        light.positional = False # False - light is directional like the sun rays are parallel, True - light is positional
+        plotter.add_light(light)
+
+    plotter.enable_shadows()
+
+    # --- 5. APPLY 3D REALISM EFFECTS ---
+    # Eye Dome Lighting adds immediate depth and contours
+    plotter.enable_eye_dome_lighting()
+
+    # Screen Space Ambient Occlusion (SSAO) is great for realistic shadows
+    # darkens crevices and corners
+    # plotter.enable_ssao(
+    #     radius=5,       # pixel radius
+    #     bias=0.025     # prevent self occlusion, low - may be noisy, high - small valleys may lose ambient shadows
+    # )
+
+    # Anti-aliasing for smooth edges
+    plotter.enable_anti_aliasing() # smooths out jagged edges, limit stairstepping
+
+    # --- 5. EXACT CAMERA SETUP (No Padding) ---
+    
+    plotter.camera_position = [(center_x, center_y, center_z),
+                               (center_x, center_y, 0),
+                               (0, 1, 0)]
+    plotter.camera.SetParallelProjection(True)
+    plotter.camera.clipping_range = (1, 1_000_000)
+    
+    # 2. Set Scale to EXACTLY match the vertical height of the data
+    # parallel_scale = half the world-space height of the viewport
+    plotter.camera.parallel_scale = rows / 2.0
+    
+    # --- 6. TILED RENDERING WITH ASPECT RATIO MATCH ---
+    
+    # Set Window Aspect Ratio to match Data Aspect Ratio
+    aspect_ratio = cols / rows
+    
+    # Choose a base tile size that respects this ratio
+    max_tile_dim = 2048
+    
+    if aspect_ratio > 1:
+        # Wider than tall
+        win_w = max_tile_dim
+        win_h = int(max_tile_dim / aspect_ratio)
+    else:
+        # Taller than wide
+        win_h = max_tile_dim
+        win_w = int(max_tile_dim * aspect_ratio)
+        
+    plotter.window_size = [win_w, win_h]
+    
+    # Calculate Magnification to reach full resolution
+    mag = int(np.ceil(cols / win_w))
+    
+    print(f"Rendering: Data {cols}x{rows}, Window {win_w}x{win_h}, Mag {mag}x")
+    
+    big_img = plotter.screenshot(
+        transparent_background=False, 
+        return_img=True, 
+        window_size=[win_w, win_h],
+        scale=mag 
+    )
+    
+    plotter.close()
+    
+    # Resize/Crop to exact pixel dimensions
+    from PIL import Image as PILImage
+    pil_img = PILImage.fromarray(big_img)
+    pil_img = pil_img.resize((cols, rows), PILImage.LANCZOS)
+    
+    hillshade_array = np.array(pil_img)
+
+    # Convert RGB to Grayscale
+    if hillshade_array.ndim == 3:
+        hillshade_array = np.dot(hillshade_array[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
+        
+    # save hillshade_array as a png
+    #Image.fromarray(hillshade_array, mode="L").save("test_ray_trace.png", format="PNG", optimize=True)
+
+    print(f"Ray trace complete. Output shape: {hillshade_array.shape}")
+    return hillshade_array

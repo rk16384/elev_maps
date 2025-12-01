@@ -135,7 +135,7 @@
         "cache": {
             "dem": true,
             "state_boundary": true,
-            "hillshade": true,
+            "hillshade": false,
             "elevation_coloring": false,
             "water": true,
             "shadow": false
