@@ -199,7 +199,7 @@ def create_extrusion_shadow(
     elif phi_deg >= 0 and phi_deg < 90:
         max_z = np.nanmax(np.concatenate((dem_data_scaled[:, 0], dem_data_scaled[-1, :]))) # right and bottom
 
-    if max_z is np.nan:
+    if max_z is np.nan or np.isnan(max_z):
         max_z = np.nanmax(dem_data_scaled)
 
     max_shadow_len = (max_z * scale) / tan_theta

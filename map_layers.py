@@ -835,6 +835,105 @@ class WaterLayer(BaseLayer):
             print(f"Error fetching water features: {e}")
             return None
 
+    def fetch_great_lakes(self, polygon_geom: Polygon, use_cache: bool = True) -> Optional[gpd.GeoDataFrame]:
+        """
+        Fetch Great Lakes/ocean polygons from NHD for shoreline clipping.
+        These are the large water bodies that extend beyond state political boundaries.
+        
+        Args:
+            polygon_geom: Shapely Polygon defining the area of interest
+            use_cache: Whether to use cached data
+            
+        Returns:
+            GeoDataFrame with Great Lakes polygons, or None if not found
+        """
+        # Cache path for Great Lakes
+        bbox = polygon_geom.bounds
+        bbox_str = format_bbox_string(bbox)
+        cache_path = os.path.join(self.cache_dir, f"great_lakes_{self.location_name}_{bbox_str}.geojson")
+        
+        if use_cache and os.path.exists(cache_path):
+            print(f"Loading cached Great Lakes data from {cache_path}")
+            return gpd.read_file(cache_path)
+        
+        print("Fetching Great Lakes polygons from NHD...")
+        try:
+            bbox = polygon_geom.bounds
+            # Great Lakes are classified as large lakes in NHD, not seas/oceans
+            # We query by name since FCodes for lakes are generic
+            # The Great Lakes names in NHD: Lake Superior, Lake Michigan, Lake Huron, Lake Erie, Lake Ontario
+            great_lakes_names = [
+                "Lake Superior",
+                "Lake Michigan", 
+                "Lake Huron",
+                "Lake Erie",
+                "Lake Ontario",
+            ]
+            
+            # Also include sea/ocean codes for coastal states
+            great_lakes_fcodes = [
+                44500,  # SeaOcean
+                44501,  # Sea/Ocean - Atlantic
+                44502,  # Sea/Ocean - Pacific
+            ]
+            
+            # Query layers 10, 11 (small scale waterbodies)
+            layers = [10, 11]
+            all_features = []
+            
+            # Build WHERE clause: search by name for Great Lakes OR by FCode for oceans
+            name_conditions = " OR ".join([f"GNIS_Name LIKE '%{name}%'" for name in great_lakes_names])
+            fcode_condition = f"FCode IN ({','.join(map(str, great_lakes_fcodes))})"
+            where_clause = f"({name_conditions}) OR ({fcode_condition})"
+            encoded_where = quote(where_clause)
+            
+            for layer in layers:
+                nhd_url = (
+                    "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/"
+                    f"{layer}/query?"
+                    f"geometry={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}&"
+                    "geometryType=esriGeometryEnvelope&"
+                    "spatialRel=esriSpatialRelIntersects&"
+                    "outFields=*&"
+                    "returnGeometry=true&"
+                    "f=geojson&"
+                    "inSR=4326&outSR=4326&"
+                    f"where={encoded_where}"
+                )
+                
+                print(f"Querying NHD layer {layer} for Great Lakes...")
+                response = requests.get(nhd_url, timeout=120)
+                if response.status_code == 200 and response.text:
+                    try:
+                        features = gpd.read_file(io.StringIO(response.text))
+                        if not features.empty:
+                            all_features.append(features)
+                            print(f"Found {len(features)} Great Lakes features in layer {layer}")
+                            if 'GNIS_Name' in features.columns:
+                                print(f"  Names: {features['GNIS_Name'].unique().tolist()}")
+                    except Exception as e:
+                        print(f"Could not parse GeoJSON for layer {layer}: {e}")
+                else:
+                    print(f"Layer {layer} query failed with status {response.status_code}")
+            
+            if not all_features:
+                print("No Great Lakes features found in area")
+                return None
+            
+            great_lakes_gdf = pd.concat(all_features, ignore_index=True)
+            print(f"Total Great Lakes features: {len(great_lakes_gdf)}")
+            
+            # Save to cache
+            great_lakes_gdf.to_file(cache_path, driver='GeoJSON')
+            
+            return great_lakes_gdf
+            
+        except Exception as e:
+            print(f"Error fetching Great Lakes: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _save_to_cache(self, data: gpd.GeoDataFrame, filepath: str) -> None:
         """Save water features to GeoJSON cache file."""
         if data is not None:
@@ -1087,6 +1186,56 @@ class StateBoundaryLayer(BaseLayer):
         land_union = self.land_gdf.geometry.unary_union
         clipped = state_geom.intersection(land_union)
         return clipped
+
+    def get_state_polygon_shoreline_clipped(self, state_name: str, 
+                                            great_lakes_gdf: Optional[gpd.GeoDataFrame] = None,
+                                            country_name: str = "United States of America") -> Polygon:
+        """
+        Get the state polygon clipped to the actual shoreline using NHD Great Lakes data.
+        
+        This removes the portions of the political boundary that extend into 
+        large water bodies (Great Lakes, oceans) while preserving inland boundaries.
+        
+        Args:
+            state_name: Name of the state
+            great_lakes_gdf: GeoDataFrame with Great Lakes polygons from NHD.
+                            If None, returns the unclipped state polygon.
+            country_name: Name of the country
+            
+        Returns:
+            Shapely Polygon/MultiPolygon clipped to shoreline
+        """
+        # Get the political state boundary (not clipped to NE land data)
+        state_geom = self.get_state_polygon(state_name, country_name, land_only=False)
+        
+        if great_lakes_gdf is None or great_lakes_gdf.empty:
+            print("No Great Lakes data provided, returning unclipped state polygon")
+            return state_geom
+        
+        try:
+            # Ensure same CRS
+            if great_lakes_gdf.crs is None:
+                great_lakes_gdf = great_lakes_gdf.set_crs("EPSG:4326")
+            
+            # Union all Great Lakes polygons
+            lakes_union = great_lakes_gdf.geometry.unary_union
+            
+            # Subtract the Great Lakes from the state polygon
+            # This clips the state boundary to the shoreline
+            clipped = state_geom.difference(lakes_union)
+            
+            if clipped.is_empty:
+                print("Warning: Clipped state polygon is empty, returning original")
+                return state_geom
+            
+            print(f"Successfully clipped state polygon to Great Lakes shoreline")
+            return clipped
+            
+        except Exception as e:
+            print(f"Error clipping state to shoreline: {e}")
+            import traceback
+            traceback.print_exc()
+            return state_geom
 
     def create_state_mask(self, state_polygon: Polygon, dem_data: xarray.DataArray) -> np.ndarray:
         """

@@ -111,217 +111,7 @@ def norm_hillshade(dem, sun_azimuth, sun_altitude):
 
     return hillshade_data
 
-def custom_rvt_option1(dem):
-    primary_azimuith = 330
-    primary_weight = 0.6
-    slope = xdem.terrain.slope(dem).data.squeeze()
-    slope_high = 25.0  # degrees at which we stop brightening
-    slope_norm = np.clip(slope / slope_high, 0.0, 1.0)
-    flat_power = 1.8
-    flat_boost = 0.09
-    flat_weight = np.power(1.0 - slope_norm, flat_power)
-
-    
-
-    num_list = [4]
-    for num in num_list:
-        rvt_list = []
-        azimuth_list = np.array([primary_azimuith + i*360/num for i in range(num)]) % 360
-        for azimuth in azimuth_list:
-            hillshade = norm_hillshade(dem, azimuth, 30)
-            rvt_list.append(hillshade)
-
-        hllshade_combo = test_rvt_combos(rvt_list, f"rvt_hillshade_num_{num}")
-
-        hllshade_combo = np.asarray(hllshade_combo, dtype=np.float32)
-
-        low_cutoff = np.nanpercentile(hllshade_combo, 2)
-        high_cutoff = np.nanpercentile(hllshade_combo, 98)
-        if not np.isfinite(low_cutoff):
-            low_cutoff = 0.0
-        if not np.isfinite(high_cutoff) or high_cutoff <= low_cutoff:
-            high_cutoff = low_cutoff + 1e-6
-
-        normalized = np.clip((hllshade_combo - low_cutoff) / (high_cutoff - low_cutoff), 0.0, 1.0)
-        normalized = np.clip(normalized + flat_weight * flat_boost, 0.0, 1.0)
-
-        neutral_gamma = 0.9
-        normalized = np.power(normalized, neutral_gamma)
-
-        shadow_weight = np.power(1.0 - normalized, 2.5)
-        normalized = np.clip(normalized + shadow_weight * 0.04, 0.0, 1.0)
-
-        highlight_weight = np.power(normalized, 3.0)
-        normalized = np.clip(normalized + highlight_weight * 0.05, 0.0, 1.0)
-
-        hillshade_uint8 = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
-
-        hillshade_img = Image.fromarray(hillshade_uint8, mode="L")
-        hillshade_img = ImageEnhance.Contrast(hillshade_img).enhance(1.15)
-        hillshade_img.save(f"rvt_option1.png", format="PNG", optimize=True)
-
-def custom_rvt_option2(dem):
-    primary_azimuith = 330
-    primary_weight = 0.6
-    slope = xdem.terrain.slope(dem).data.squeeze()
-    slope_high = 25.0  # degrees at which we stop brightening
-    slope_norm = np.clip(slope / slope_high, 0.0, 1.0)
-    flat_power = 1.8
-    flat_boost = 0.09
-    flat_weight = np.power(1.0 - slope_norm, flat_power)
-    num_directions = 4
-
-    
-
-    num_list = [num_directions]
-    for num in num_list:
-        rvt_list = []
-        azimuth_list = np.array([primary_azimuith + i*360/num for i in range(num)]) % 360
-        for azimuth in azimuth_list:
-            hillshade = norm_hillshade(dem, azimuth, 30)
-            rvt_list.append(hillshade)
-
-        hllshade_combo = test_rvt_combos(rvt_list, f"rvt_hillshade_num_{num}")
-
-        hllshade_combo = np.asarray(hllshade_combo, dtype=np.float32)
-
-        low_cutoff = np.nanpercentile(hllshade_combo, 2)
-        high_cutoff = np.nanpercentile(hllshade_combo, 98)
-        if not np.isfinite(low_cutoff):
-            low_cutoff = 0.0
-        if not np.isfinite(high_cutoff) or high_cutoff <= low_cutoff:
-            high_cutoff = low_cutoff + 1e-6
-
-        normalized = np.clip((hllshade_combo - low_cutoff) / (high_cutoff - low_cutoff), 0.0, 1.0)
-        normalized = np.clip(normalized + flat_weight * flat_boost, 0.0, 1.0)
-
-        gamma_adjusted = np.power(normalized, 0.8)
-        hillshade_uint8 = np.clip(gamma_adjusted * 255.0, 0, 255).astype(np.uint8)
-        
-
-        hillshade_img = Image.fromarray(hillshade_uint8, mode="L")
-        hillshade_img = ImageEnhance.Contrast(hillshade_img).enhance(1.2)
-        #hillshade_img = ImageOps.autocontrast(hillshade_img, cutoff=1)
-        hillshade_img.save(f"rvt_option2.png", format="PNG", optimize=True)
-
-def custom_rvt_option3(dem: xdem.DEM):
-    # Parameters you can tweak
-    num_directions = 4
-    primary_azimuth = 330
-    secondary_altitude = 80  # high-altitude fill light
-    primary_altitude = 30
-    primary_weight = 0.6
-    high_altitude_weight = 0.4
-    slope_high = 25.0
-    flat_power = 1.8
-    flat_boost = 0.09
-    shadow_push = 0.04
-    highlight_push = 0.05
-    contrast_gain = 1.3
-
-    slope_degrees = xdem.terrain.slope(dem).data.squeeze()
-    slope_norm = np.clip(slope_degrees / slope_high, 0.0, 1.0)
-    flat_weight = np.power(1.0 - slope_norm, flat_power)
-
-    def _stack_for_altitude(sun_altitude: float, primary_azimuth: float, num_directions: int):
-        azimuth_list = (primary_azimuth + np.arange(num_directions) * 360 / num_directions) % 360
-        bands = []
-        for azimuth in azimuth_list:
-            bands.append(norm_hillshade(dem, azimuth, sun_altitude))
-        return np.asarray(bands, dtype=np.float32)
-
-    base_stack = _stack_for_altitude(primary_altitude, primary_azimuth, num_directions)
-    fill_stack = _stack_for_altitude(secondary_altitude, primary_azimuth, 1)
-
-    weighted = primary_weight * base_stack[0]
-    if len(base_stack) > 1:
-        residual_weight = (1 - primary_weight) / (len(base_stack) - 1)
-        for i in range(1, len(base_stack)):
-            weighted += residual_weight * base_stack[i]
-
-    fill_mean = np.nanmean(fill_stack, axis=0)
-
-    # Percentile normalization for both components
-    def _normalize(arr, lo=2, hi=98):
-        low_cut = np.nanpercentile(arr, lo)
-        high_cut = np.nanpercentile(arr, hi)
-        if not np.isfinite(low_cut):
-            low_cut = 0.0
-        if not np.isfinite(high_cut) or high_cut <= low_cut:
-            high_cut = low_cut + 1e-6
-        return np.clip((arr - low_cut) / (high_cut - low_cut), 0.0, 1.0)
-
-    weighted_norm = _normalize(weighted)
-    fill_norm = _normalize(fill_mean)
-
-    combined = np.clip(weighted_norm * (1 - high_altitude_weight) + fill_norm * high_altitude_weight, 0.0, 1.0)
-
-    combined = np.clip(combined + flat_weight * flat_boost, 0.0, 1.0)
-
-    combined = np.power(combined, 0.9)
-
-    shadow_weight = np.power(1.0 - combined, 2.5)
-    combined = np.clip(combined + shadow_weight * shadow_push, 0.0, 1.0)
-
-    highlight_weight = np.power(combined, 3.0)
-    combined = np.clip(combined + highlight_weight * highlight_push, 0.0, 1.0)
-
-    hillshade_uint8 = np.clip(combined * 255.0, 0, 255).astype(np.uint8)
-
-    hillshade_img = Image.fromarray(hillshade_uint8, mode="L")
-    hillshade_img = ImageEnhance.Contrast(hillshade_img).enhance(contrast_gain)
-    hillshade_img.save("rvt_optionx.png", format="PNG", optimize=True)
-
-
-def custom_rvt_hillshade(dem):
-    primary_azimuith = 270
-    primary_weight = 0.6
-    slope = xdem.terrain.slope(dem).data.squeeze()
-    slope_high = 25.0  # degrees at which we stop brightening
-    slope_norm = np.clip(slope / slope_high, 0.0, 1.0)
-    flat_power = 2.3
-    flat_boost = 0.12
-    flat_weight = np.power(1.0 - slope_norm, flat_power)
-
-    
-
-    num_list = [5]
-    for num in num_list:
-        rvt_list = []
-        azimuth_list = np.array([330 + i*360/num for i in range(num)]) % 360
-        for azimuth in azimuth_list:
-            hillshade = norm_hillshade(dem, azimuth, 30)
-            rvt_list.append(hillshade)
-
-        hllshade_combo = test_rvt_combos(rvt_list, f"rvt_hillshade_num_{num}")
-
-        hllshade_combo = np.asarray(hllshade_combo, dtype=np.float32)
-
-        low_cutoff = np.nanpercentile(hllshade_combo, 2)
-        high_cutoff = np.nanpercentile(hllshade_combo, 98)
-        if not np.isfinite(low_cutoff):
-            low_cutoff = 0.0
-        if not np.isfinite(high_cutoff) or high_cutoff <= low_cutoff:
-            high_cutoff = low_cutoff + 1e-6
-
-        normalized = np.clip((hllshade_combo - low_cutoff) / (high_cutoff - low_cutoff), 0.0, 1.0)
-        normalized = np.clip(normalized + flat_weight * flat_boost, 0.0, 1.0)
-
-        neutral_gamma = 0.9
-        normalized = np.power(normalized, neutral_gamma)
-
-        shadow_weight = np.power(1.0 - normalized, 2.5)
-        normalized = np.clip(normalized + shadow_weight * 0.01, 0.0, 1.0)
-
-        highlight_weight = np.power(normalized, 3.0)
-        normalized = np.clip(normalized + highlight_weight * 0.01, 0.0, 1.0)
-
-        hillshade_uint8 = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
-
-        hillshade_img = Image.fromarray(hillshade_uint8, mode="L")
-        hillshade_img = ImageEnhance.Contrast(hillshade_img).enhance(1.15)
-        hillshade_img.save(f"rvt_hillshade_num_{num}_adjusted2.png", format="PNG", optimize=True)
-        
+     
 import math
 from typing import Iterable, Optional, Sequence, Tuple
 
@@ -346,397 +136,6 @@ try:
 except ImportError:
     mi = None
 
-
-def _prepare_dem(dem_subset: np.ndarray) -> np.ndarray:
-    """Return DEM as float32 with NaNs filled by local mean."""
-    dem = np.asarray(dem_subset, dtype=np.float32)
-    if np.isnan(dem).any():
-        mask = np.isnan(dem)
-        filled = dem.copy()
-        # Simple inpainting: gaussian blur ignoring NaNs by filling zerod areas, then renormalizing.
-        filled[mask] = 0.0
-        kernel = gaussian_filter((~mask).astype(np.float32), sigma=3, mode="reflect")
-        smoothed = gaussian_filter(filled, sigma=3, mode="reflect")
-        kernel[kernel == 0] = 1.0  # avoid division
-        dem = smoothed / kernel
-    return dem
-
-
-def _hillshade(dem: np.ndarray, cellsize: float, azimuth_deg: float, altitude_deg: float) -> np.ndarray:
-    """Single-direction hillshade normalized to [0, 1]."""
-    azimuth = math.radians(azimuth_deg)
-    altitude = math.radians(altitude_deg)
-
-    dzdx, dzdy = np.gradient(dem, cellsize)
-    slope = np.arctan(np.hypot(dzdx, dzdy))
-    aspect = np.arctan2(-dzdx, dzdy)
-    hill = (
-        np.sin(altitude) * np.cos(slope)
-        + np.cos(altitude) * np.sin(slope) * np.cos(azimuth - aspect)
-    )
-    hill = np.clip(hill, 0.0, None)
-    return hill / hill.max(initial=1.0)
-
-
-def _tone_map(image: np.ndarray, lower: float = 1.0, upper: float = 99.0) -> np.ndarray:
-    """Simple percentile stretch into [0, 1]."""
-    p_low, p_high = np.percentile(image, [lower, upper])
-    if p_high - p_low < 1e-5:
-        return np.clip(image, 0.0, 1.0)
-    stretched = (image - p_low) / (p_high - p_low)
-    return np.clip(stretched, 0.0, 1.0)
-
-
-def generate_high_dynamic_relief(
-    dem_subset: np.ndarray,
-    cellsize: float,
-    azimuths: Sequence[float] = (315.0, 45.0, 225.0, 135.0),
-    altitude_deg: float = 50.0,
-    gaussian_sigma: float = 0.8,
-    local_contrast_radius: int = 35,
-) -> np.ndarray:
-    """
-    Multi-direction hillshade fusion with adaptive contrast.
-    Returns float32 image in [0, 1].
-    """
-    dem = _prepare_dem(dem_subset)
-
-    shades = []
-    for az in azimuths:
-        shade = _hillshade(dem, cellsize, az, altitude_deg)
-        if gaussian_sigma > 0:
-            shade = gaussian_filter(shade, gaussian_sigma, mode="reflect")
-        shades.append(shade)
-
-    composite = np.mean(shades, axis=0, dtype=np.float32)
-
-    if local_contrast_radius > 0:
-        blurred = gaussian_filter(composite, local_contrast_radius, mode="reflect")
-        detail = composite - blurred
-        composite = composite + 1.5 * detail  # boost micro-relief
-    return _tone_map(composite)
-
-
-def generate_sky_view_factor_relief(
-    dem_subset: np.ndarray,
-    cellsize: float,
-    hillshade_azimuth: float = 315.0,
-    hillshade_altitude: float = 45.0,
-    ao_weight: float = 0.4,
-) -> np.ndarray:
-    """
-    Blend classic hillshade with sky-view factor / ambient occlusion.
-    Requires richdem; raises if missing.
-    """
-    if rd is None:
-        raise ImportError("richdem is required for sky-view factor shading. Install richdem.")
-
-    dem = _prepare_dem(dem_subset)
-    rd_dem = rd.rdarray(dem, no_data=np.nan)
-    rd_dem.geotransform = (0.0, cellsize, 0.0, 0.0, 0.0, -cellsize)
-
-    svf = rd.TerrainAttribute(rd_dem, attrib="SkyViewFactor", zscale=1.0)
-    svf = np.asarray(svf, dtype=np.float32)
-    svf = np.clip(svf, 0.0, 1.0)
-
-    base_hillshade = _hillshade(dem, cellsize, hillshade_azimuth, hillshade_altitude)
-    fused = base_hillshade * (1.0 - ao_weight) + base_hillshade * svf * ao_weight
-    return _tone_map(fused)
-
-def generate_path_traced_relief(
-    dem_subset: np.ndarray,
-    cellsize: float,
-    spp: int = 64,
-    vertical_exaggeration: float = 1.5,
-    sun_direction: Tuple[float, float, float] = (-1.0, 1.0, 1.5),
-    mitsuba_variant: str = "scalar_rgb",
-    fov: float = 45.0,
-    mesh_downsample: int = 8,
-) -> np.ndarray:
-    """
-    Physically-based path-traced render using Mitsuba 3.
-    Returns float32 RGB image in [0, 1]. Requires mitsuba.
-    """
-    if mi is None:
-        raise ImportError("mitsuba is required for path-traced relief rendering. Install mitsuba.")
-
-    dem = _prepare_dem(dem_subset)
-    if mesh_downsample is not None and mesh_downsample > 1:
-        dem = dem[::mesh_downsample, ::mesh_downsample]
-        cellsize *= mesh_downsample
-    mi.set_variant(mitsuba_variant)
-
-    sun_dir_np = np.array(sun_direction, dtype=np.float32)
-    norm = float(np.linalg.norm(sun_dir_np))
-    if norm == 0.0:
-        sun_dir_np = np.array([-1.0, 1.0, 1.0], dtype=np.float32)
-        norm = float(np.linalg.norm(sun_dir_np))
-    sun_dir_np /= norm
-    sun_dir = mi.ScalarVector3f(*sun_dir_np.tolist())
-
-    rows, cols = dem.shape
-    if rows < 2 or cols < 2:
-        raise ValueError("DEM subset too small to build mesh for path tracing.")
-
-    xs = (np.arange(cols, dtype=np.float32) - cols / 2.0) * cellsize
-    ys = (np.arange(rows, dtype=np.float32) - rows / 2.0) * cellsize
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    elevations = dem.astype(np.float32) * vertical_exaggeration
-
-    vertices = np.column_stack((grid_x.ravel(), grid_y.ravel(), elevations.ravel()))
-    faces = []
-    for r in range(rows - 1):
-        for c in range(cols - 1):
-            v0 = r * cols + c
-            v1 = v0 + 1
-            v2 = v0 + cols
-            v3 = v2 + 1
-            faces.append((v0, v2, v1))
-            faces.append((v1, v2, v3))
-    faces = np.asarray(faces, dtype=np.int32)
-
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False, mode="w") as tmp:
-        ply_path = tmp.name
-        tmp.write("ply\n")
-        tmp.write("format ascii 1.0\n")
-        tmp.write(f"element vertex {len(vertices)}\n")
-        tmp.write("property float x\n")
-        tmp.write("property float y\n")
-        tmp.write("property float z\n")
-        tmp.write(f"element face {len(faces)}\n")
-        tmp.write("property list uchar int vertex_indices\n")
-        tmp.write("end_header\n")
-        for vx, vy, vz in vertices:
-            tmp.write(f"{vx} {vy} {vz}\n")
-        for tri in faces:
-            tmp.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
-
-    scene_dict = {
-        "type": "scene",
-        "integrator": {"type": "path"},
-        "sensor": {
-            "type": "perspective",
-            "fov": fov,
-            "to_world": mi.ScalarTransform4f.look_at(
-                origin=mi.ScalarPoint3f(0.0, -max(dem.shape) * cellsize, max(dem.shape) * vertical_exaggeration * 1.5),
-                target=mi.ScalarPoint3f(0.0, 0.0, 0.0),
-                up=mi.ScalarVector3f(0.0, 0.0, 1.0),
-            ),
-            "sampler": {"type": "independent", "sample_count": spp},
-            "film": {"type": "hdrfilm", "width": 1920, "height": 1080, "rfilter": {"type": "box"}},
-        },
-        "shape": {
-            "type": "ply",
-            "filename": ply_path,
-            "bsdf": {
-                "type": "roughplastic",
-                "alpha": 0.2,
-                "diffuse_reflectance": {"type": "rgb", "value": [0.7, 0.7, 0.7]},
-            },
-        },
-        "emitter": {
-            "type": "directional",
-            "direction": sun_dir,
-            "irradiance": {"type": "rgb", "value": [4.0, 4.0, 4.0]},
-        },
-        "environment": {"type": "constant", "radiance": {"type": "rgb", "value": [0.2, 0.2, 0.25]}},
-    }
-
-    try:
-        scene = mi.load_dict(scene_dict)
-        rendered = mi.render(scene, spp=spp)
-    finally:
-        try:
-            os.remove(ply_path)
-        except OSError:
-            pass
-    return np.array(rendered, dtype=np.float32)
-
-def generate_ray_traced_relief(
-    dem_subset: np.ndarray,
-    cellsize: float,
-    vertical_exaggeration: float = 1.5,
-    window_size: Tuple[int, int] = (1920, 1080),
-    camera_position: Tuple[float, float, float] = (4000.0, -4000.0, 3000.0),
-    focal_point: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-    view_up: Tuple[float, float, float] = (0.0, 0.0, 1.0),
-    sun_direction: Tuple[float, float, float] = (-1.0, 1.0, 1.5),
-    ambient_intensity: float = 0.15,
-    downsample: Optional[int] = 4,
-) -> np.ndarray:
-    """
-    Off-screen ray-traced render using PyVista/VTK.
-    Returns uint8 RGB image. Requires pyvista>=0.42 and ray tracing capable backend.
-    """
-    if pv is None:
-        raise ImportError("pyvista is required for ray-traced relief rendering. Install pyvista.")
-
-    dem = _prepare_dem(dem_subset)
-    print(
-        "[raytrace] input array",
-        {"shape": dem.shape, "cellsize": round(cellsize, 3), "min": float(np.nanmin(dem)), "max": float(np.nanmax(dem))},
-    )
-    if downsample is not None and downsample > 1:
-        dem = dem[::downsample, ::downsample]
-        cellsize *= downsample
-        print("[raytrace] downsampled array", {"shape": dem.shape, "cellsize": round(cellsize, 3)})
-
-    nrows, ncols = dem.shape
-    grid = pv.ImageData(dimensions=(ncols, nrows, 1))
-    grid.origin = (0.0, 0.0, float(dem.min()))
-    grid.spacing = (cellsize, cellsize, vertical_exaggeration)
-    grid.point_data["elevation"] = dem.T.reshape(-1)
-    if hasattr(grid, "set_active_scalars"):
-        grid.set_active_scalars("elevation", preference="point")
-
-    surface = grid.warp_by_scalar("elevation", factor=1.0)
-    if hasattr(surface, "extract_surface"):
-        surface = surface.extract_surface()
-    if hasattr(surface, "compute_normals"):
-        try:
-            surface = surface.compute_normals(inplace=False)
-        except TypeError:
-            surface = surface.compute_normals()
-    surface_points = np.asarray(surface.points)
-    z_range = float(np.ptp(surface_points[:, 2])) if surface_points.size else 0.0
-    bounds = getattr(surface, "bounds", None)
-    print(
-        "[raytrace] surface stats",
-        {"points": surface.n_points, "cells": surface.n_cells, "z_range": round(z_range, 3), "bounds": bounds},
-    )
-
-    plotter = pv.Plotter(off_screen=True, window_size=window_size)
-    plotter.set_background("black")
-    plotter.add_mesh(
-        surface,
-        scalars=surface.points[:, 2] if surface.points.shape[1] >= 3 else None,
-        cmap="gray",
-        smooth_shading=True,
-        diffuse=0.6,
-        ambient=0.02,
-        specular=0.05,
-        show_scalar_bar=False,
-    )
-    if hasattr(plotter, "enable_ray_tracing"):
-        plotter.enable_ray_tracing()
-    else:
-        plotter.enable_shadows()
-
-    if bounds:
-        target = (
-            (bounds[0] + bounds[1]) * 0.5,
-            (bounds[2] + bounds[3]) * 0.5,
-            (bounds[4] + bounds[5]) * 0.5,
-        )
-    else:
-        target = tuple(focal_point)
-    cam_offset = np.array(camera_position) - np.array(focal_point)
-    camera_pos = tuple(np.array(target) + cam_offset)
-    plotter.camera_position = [camera_pos, target, view_up]
-
-    sun_vec = np.array(sun_direction, dtype=np.float32)
-    sun_norm = float(np.linalg.norm(sun_vec))
-    if sun_norm == 0.0:
-        sun_vec = np.array([-1.0, 1.0, 1.0], dtype=np.float32)
-        sun_norm = float(np.linalg.norm(sun_vec))
-    sun_vec = sun_vec / sun_norm
-    print("[raytrace] sun vector", sun_vec.tolist())
-
-    if hasattr(plotter, "renderer"):
-        try:
-            plotter.renderer.lights.clear()
-        except Exception:
-            pass
-
-    sun_pos = tuple((-sun_vec * 5000.0).tolist())
-    light_focus = tuple(focal_point)
-    print("[raytrace] main light", {"position": sun_pos, "focus": light_focus})
-
-    main_light = pv.Light(
-        light_type="scenelight",
-        position=sun_pos,
-        focal_point=light_focus,
-        color="white",
-        intensity=0.6,
-    )
-    plotter.add_light(main_light)
-
-    fill_vec = sun_vec * np.array([1.0, -1.0, 0.3], dtype=np.float32)
-    fill_pos = tuple((-fill_vec * 3000.0).tolist())
-    fill_light = pv.Light(
-        light_type="scenelight",
-        position=fill_pos,
-        focal_point=light_focus,
-        color="white",
-        intensity=0.2,
-    )
-    print("[raytrace] fill light", {"position": fill_pos, "intensity": fill_light.intensity})
-
-    plotter.add_light(fill_light)
-
-    if hasattr(plotter, "camera_position"):
-        print("[raytrace] camera position", plotter.camera_position)
-
-    image = plotter.screenshot(return_img=True, transparent_background=False)
-    plotter.close()
-    if isinstance(image, np.ndarray):
-        print(
-            "[raytrace] image stats",
-            {"dtype": str(image.dtype), "shape": image.shape, "min": int(image.min()), "max": int(image.max()), "mean": float(image.mean())},
-        )
-        Image.fromarray(image).save("ray_traced_relief.png", optimize=True)
-    else:
-        image.save("ray_traced_relief.png")
-    return image
-
-def run_advanced_relief_variants(
-    dem_subset,
-    output_prefix="dem_subset",
-    raytrace_downsample=8,
-    pathtrace_spp=64,
-):
-    """Render and persist advanced relief variants for the supplied subset."""
-    subset_array = np.asarray(dem_subset.values, dtype=np.float32).squeeze()
-    transform = dem_subset.rio.transform()
-    cellsize_x = float(abs(transform.a))
-    cellsize_y = float(abs(transform.e))
-    cellsize = float((cellsize_x + cellsize_y) * 0.5)
-
-    # high_dynamic = generate_high_dynamic_relief(subset_array, cellsize)
-    # Image.fromarray((high_dynamic * 255).astype(np.uint8), mode="L").save(
-    #     f"{output_prefix}_high_dynamic_relief.png",
-    #     optimize=True,
-    # )
-
-    # svf_relief = None
-    # try:
-    #     svf_relief = generate_sky_view_factor_relief(subset_array, cellsize)
-    # except ImportError:
-    #     print("Skipping sky-view factor relief: richdem not installed.", flush=True)
-    # except Exception as exc:
-    #     print(f"Sky-view factor relief failed: {exc}", flush=True)
-    # if svf_relief is not None:
-    #     Image.fromarray((svf_relief * 255).astype(np.uint8), mode="L").save(
-    #         f"{output_prefix}_sky_view_relief.png",
-    #         optimize=True,
-    #     )
-
-    ray_relief = None
-    try:
-        ray_relief = generate_ray_traced_relief(
-            subset_array,
-            cellsize,
-            downsample=raytrace_downsample,
-        )
-    except ImportError:
-        print("Skipping ray-traced relief: pyvista not installed.", flush=True)
-    except Exception as exc:
-        print(f"Ray-traced relief failed: {exc}", flush=True)
-    if ray_relief is not None:
-        Image.fromarray(ray_relief.astype(np.uint8)).save(
-            f"{output_prefix}_ray_traced_relief.png",
-            optimize=True,
-        )
 
 def create_hillshade(
     dem_data,
@@ -786,8 +185,6 @@ def create_hillshade(
         )
         hillshade_data = np.asarray(hillshade_data, dtype=np.float32)
         hillshade_data = np.nanmean(hillshade_data, axis=0)
-    elif hillshade_type == "ray_trace":
-        hillshade_data = create_ray_traced_hillshade(dem_data)
     elif hillshade_type == "og":
         hillshade = xdem.terrain.hillshade(
             dem,
@@ -981,7 +378,8 @@ def create_printable_map(map_data: MapData,
                         border: bool = False,
                         shadow: bool = True,
                         input_font: str = "Bodoni 72 OS",
-                        font_index: int = 0) -> tuple[str, str]:
+                        font_index: int = 0,
+                        use_title: bool = True) -> tuple[str, str]:
     """
     Create printable versions (PDF and high-res image) of a hillshade map with title and drop shadow.
     
@@ -1102,6 +500,8 @@ def create_printable_map(map_data: MapData,
     # Try to find the optimal font size that fits within both width and height
     font = None
     font_size = base_font_size
+    if not use_title:
+        font_size = 0
     while font_size > 12:  # Don't go smaller than 12px
         try:
             font = ImageFont.truetype(f"/System/Library/Fonts/Supplemental/{input_font}", font_size, index=font_index)
@@ -1292,6 +692,9 @@ def generate_map(create_debug_grid=False,
         # Mask the DEM data itself
         map_data.dem_data = map_data.dem_data.where(map_data.location_mask)
 
+        # save location mask to image
+        save_to_image(map_data.location_mask, 'location_mask_debug', map_data)
+
     # --- SHADOW ---
     if map_data.use_cache_shadow and map_data.cache_exists('shadow'):
         print("Loading shadow from cache...")
@@ -1320,6 +723,9 @@ def generate_map(create_debug_grid=False,
             import pickle
             with open(shadow_offsets_path, 'wb') as f:
                 pickle.dump(map_data.shadow_offsets, f)
+
+            # save shadow to image
+    save_to_image(map_data.shadow_img, 'shadow_debug', map_data)
 
     # --- WATER MASK ---
     if map_data.include_water and water_layer is not None:
@@ -1542,7 +948,7 @@ def downsample_dem(
 
 if __name__ == "__main__":
     # Example usage for a state
-    title = "Utah"
+    title = " "
     sun_azimuth = 300
     sun_altitude = 65
     land_only = True  # Set to False to include state marine/Great Lakes territory
@@ -1557,7 +963,7 @@ if __name__ == "__main__":
     from map_data import MapData
 
     base_dir = "/Volumes/sandisk1"
-    location = "Utah"
+    location = "Michigan"
     map_data = MapData(location_name=location, base_dir=base_dir)
 
 
@@ -1576,18 +982,6 @@ if __name__ == "__main__":
         map_data=map_data
     )
 
-    # if map_data.location_type == 'state':
-    #     # Now get the state mask for the DEM
-    #     state_mask = map_data.location_layer.create_state_mask(map_data.location_polygon, map_data.dem_data)
-    # else:
-    #     state_mask = None
-
-    # save state mask to rgbimage
-    # if state_mask is not None:
-    #     # Ensure the array is C-contiguous before passing to fromarray
-    #     contiguous_mask = np.ascontiguousarray(state_mask.astype('uint8') * 255)
-    #     state_mask_img = Image.fromarray(contiguous_mask, 'L')
-    #     state_mask_img.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", f"{title}_state_mask.png"))
 
     output_dir = os.path.join(base_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
@@ -1596,11 +990,11 @@ if __name__ == "__main__":
         map_data=map_data,
         title=title,
         output_prefix=printable_base,
-        width_inches=20.0,
-        height_inches=30.0,
+        width_inches=25.0,
+        height_inches=25.0,
         margin_inches=0.1,
         dpi=500, # 2400
-        border=True,
+        border=False,
         shadow=True,
         input_font=font_file,
         font_index=font_idx

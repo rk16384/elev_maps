@@ -66,6 +66,7 @@
     },
     "Michigan": {
         "type": "state",
+        "clip_to_shoreline": true,
         "common": {
             "transparent_background": true,
             "do_hillshade": true,
@@ -99,11 +100,17 @@
         },
         "cache": {
             "dem": true,
-            "state_boundary": true,
-            "hillshade": false,
+            "state_boundary": false,
+            "hillshade": true,
             "elevation_coloring": true,
             "water": true,
             "shadow": true
+        },
+        "shadow_config": {
+            "light_elevation_deg": 70,
+            "light_azimuth": 315,
+            "scale": 0.2,
+            "transparent_background": true
         }
     },
     "Utah": {

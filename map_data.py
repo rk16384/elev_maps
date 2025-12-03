@@ -8,7 +8,7 @@ import xarray
 import os
 import json
 
-from map_layers import StateBoundaryLayer
+from map_layers import StateBoundaryLayer, WaterLayer
 
 
 @dataclass
@@ -66,6 +66,8 @@ class MapData:
     polygon_geom: Optional[Polygon] = field(init=False, default=None)
     location_polygon: Optional[Polygon] = field(init=False, default=None)
     location_layer: Optional['StateBoundaryLayer'] = field(init=False, default=None)
+    # Store unclipped bbox for consistent cache paths (clipping changes bounds)
+    cache_bbox: Optional[Tuple[float, float, float, float]] = field(init=False, default=None)
 
 
     location_mask: Optional[np.ndarray] = field(init=False, default=None)
@@ -149,13 +151,18 @@ class MapData:
         """Load data from location config"""
         # load location config
         if self.location_config['type'] == 'state':
-            self.location_polygon, self.bbox, self.location_layer = self.get_state_bbox_and_mask()
+            # Check if shoreline clipping is enabled in config (defaults to True for states)
+            clip_to_shoreline = self.location_config.get('clip_to_shoreline', True)
+            self.location_polygon, self.bbox, self.location_layer, self.cache_bbox = self.get_state_bbox_and_mask(
+                clip_to_shoreline=clip_to_shoreline
+            )
             
         elif self.location_config['type'] == 'coordinates':
             # Convert from [lat, lon] to [lon, lat] for Shapely
             coordinates = [(coord[1], coord[0]) for coord in self.location_config['coordinates']]
             self.location_polygon = Polygon(coordinates)
             self.bbox = self.location_polygon.bounds
+            self.cache_bbox = self.bbox  # No clipping for coordinates
 
         elif self.location_config['type'] == 'center_point':
             # make a box around the center point
@@ -169,6 +176,7 @@ class MapData:
                 (center_point[0] - radius, center_point[1] - radius)
             ])
             self.bbox = self.location_polygon.bounds
+            self.cache_bbox = self.bbox  # No clipping for center_point
         else:
             raise ValueError(f"Invalid location type: {self.location_config['type']}")
 
@@ -197,7 +205,8 @@ class MapData:
 
     def get_cache_path(self, component: str, extension: str = None) -> str:
         """Get cache file path for a specific component"""
-        bbox = self.location_polygon.bounds
+        # Use cache_bbox (unclipped) for consistent paths, fall back to location_polygon bounds
+        bbox = self.cache_bbox if self.cache_bbox else self.location_polygon.bounds
         bbox_str = f"{bbox[0]:.3f}_{bbox[1]:.3f}_{bbox[2]:.3f}_{bbox[3]:.3f}"
         
         if extension is None:
@@ -297,14 +306,42 @@ class MapData:
                 os.remove(cache_file)
                 print(f"Removed cache file: {cache_file}")
 
-    def get_state_bbox_and_mask(self, land_only=True):
+    def get_state_bbox_and_mask(self, land_only=True, clip_to_shoreline=True):
         """
         Get the state polygon, bounding box, and (optionally) a mask for a DEM.
-        If dem_data is provided, returns the mask as well.
+        
+        Args:
+            land_only: If True, clip to Natural Earth land data (coarse)
+            clip_to_shoreline: If True, clip to NHD Great Lakes shoreline (accurate).
+                              This takes precedence over land_only for coastal states.
+        
+        Returns:
+            Tuple of (state_polygon, bbox, state_layer, cache_bbox)
+            - bbox: bounds of the clipped polygon (for DEM fetching)
+            - cache_bbox: bounds of the unclipped polygon (for consistent cache paths)
         """
         cache_root = os.path.join(self.base_dir, "data_cache")
         state_layer = StateBoundaryLayer(cache_dir=cache_root, location_name=self.location_name.lower())
-        state_polygon = state_layer.get_state_polygon(self.location_name, land_only=land_only)
-        bbox = state_polygon.bounds
-
-        return state_polygon, bbox, state_layer
+        
+        # Always get the full state polygon first for consistent cache paths
+        full_state_polygon = state_layer.get_state_polygon(self.location_name, land_only=False)
+        cache_bbox = full_state_polygon.bounds  # Use unclipped bounds for cache
+        
+        if clip_to_shoreline:
+            # Use NHD Great Lakes data for accurate shoreline clipping
+            water_layer = WaterLayer(cache_dir=cache_root, location_name=self.location_name.lower())
+            
+            # Fetch Great Lakes data for this area
+            great_lakes_gdf = water_layer.fetch_great_lakes(full_state_polygon, use_cache=True)
+            
+            # Get the state polygon clipped to shoreline
+            state_polygon = state_layer.get_state_polygon_shoreline_clipped(
+                self.location_name, 
+                great_lakes_gdf=great_lakes_gdf
+            )
+        else:
+            # Use the original method (Natural Earth land data or political boundary)
+            state_polygon = state_layer.get_state_polygon(self.location_name, land_only=land_only)
+        
+        bbox = full_state_polygon.bounds  # Use full bounds for DEM fetching too
+        return state_polygon, bbox, state_layer, cache_bbox
