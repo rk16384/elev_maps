@@ -104,7 +104,7 @@
             "hillshade": true,
             "elevation_coloring": true,
             "water": true,
-            "shadow": true
+            "shadow": false
         },
         "shadow_config": {
             "light_elevation_deg": 70,
@@ -142,10 +142,10 @@
         "cache": {
             "dem": true,
             "state_boundary": true,
-            "hillshade": false,
+            "hillshade": true,
             "elevation_coloring": false,
             "water": true,
-            "shadow": false
+            "shadow": true
         }
     },
     "Astoria": {
@@ -184,7 +184,7 @@
         "cache": {
             "dem": true,
             "state_boundary": true,
-            "hillshade": false,
+            "hillshade": true,
             "elevation_coloring": true,
             "water": true,
             "shadow": true

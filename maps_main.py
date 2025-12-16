@@ -716,13 +716,12 @@ def generate_map(create_debug_grid=False,
             state_mask=map_data.location_mask
         )
         
-        if map_data.use_cache_shadow:
-            map_data.save_to_cache('shadow', map_data.shadow_img)
-            # Save shadow offsets separately
-            shadow_offsets_path = map_data.get_cache_path('shadow_offsets', '.pkl')
-            import pickle
-            with open(shadow_offsets_path, 'wb') as f:
-                pickle.dump(map_data.shadow_offsets, f)
+        map_data.save_to_cache('shadow', map_data.shadow_img)
+        # Save shadow offsets separately
+        shadow_offsets_path = map_data.get_cache_path('shadow_offsets', '.pkl')
+        import pickle
+        with open(shadow_offsets_path, 'wb') as f:
+            pickle.dump(map_data.shadow_offsets, f)
 
             # save shadow to image
     save_to_image(map_data.shadow_img, 'shadow_debug', map_data)
@@ -948,7 +947,7 @@ def downsample_dem(
 
 if __name__ == "__main__":
     # Example usage for a state
-    title = " "
+    title = "Utah"
     sun_azimuth = 300
     sun_altitude = 65
     land_only = True  # Set to False to include state marine/Great Lakes territory
@@ -963,7 +962,7 @@ if __name__ == "__main__":
     from map_data import MapData
 
     base_dir = "/Volumes/sandisk1"
-    location = "Michigan"
+    location = "Utah"
     map_data = MapData(location_name=location, base_dir=base_dir)
 
 
@@ -990,12 +989,12 @@ if __name__ == "__main__":
         map_data=map_data,
         title=title,
         output_prefix=printable_base,
-        width_inches=25.0,
-        height_inches=25.0,
-        margin_inches=0.1,
+        width_inches=20.0,
+        height_inches=30.0,
+        margin_inches=0.5,
         dpi=500, # 2400
         border=False,
-        shadow=True,
+        shadow=False,
         input_font=font_file,
         font_index=font_idx
     )
