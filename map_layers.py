@@ -539,7 +539,7 @@ class ElevationLayer(BaseLayer):
                         print(f"Warning: Could not remove temporary file {f}: {e}")
         
         # Progressive merge strategy
-        batch_size = 6  # Merge 10 tiles at a time
+        batch_size = 4  # Merge 10 tiles at a time
         current_tiles = processed_tiles.copy()
         batch_num = 1
         
@@ -744,23 +744,26 @@ class WaterLayer(BaseLayer):
             # 4,5,6: Flowline - Small/Large Scale (rivers/streams)
             # 7,8,9: Area - Small/Large Scale
             layers = [10, 11, 12, 4, 5, 6, 7, 8, 9]
-            layers = [10, 11, 12] # for
+            layers = [10, 11, 12, 5, 6, 7, 8, 9]
+            #layers = [10, 11, 12] # for
             all_water_features = []
             
             # FCodes for water features
             include_fcodes = [
                 # Oceans and Seas
-                44500,  # SeaOcean
-                44501,  # Sea/Ocean - Atlantic
-                44502,  # Sea/Ocean - Pacific
-                44503,  # Sea/Ocean - Arctic
-                44504,  # Sea/Ocean - Indian
+                #44500,  # SeaOcean
+                #44501,  # Sea/Ocean - Atlantic
+                #44502,  # Sea/Ocean - Pacific
+                #44503,  # Sea/Ocean - Arctic
+                #44504,  # Sea/Ocean - Indian
                 # Lakes and Ponds
                 39004,  # Lake/Pond - Perennial
                 39009,  # Lake/Pond - Average water elevation
                 39010,  # Lake/Pond - Normal pool
                 # Rivers and Streams
-                #46006,  # StreamRiver - Perennial
+                46006,  # StreamRiver - Perennial
+                46000, # stream river general
+                46007, # stream river navigable
                 #46003,  # StreamRiver - Intermittent
                 # Coastal Features
                 31200,  # BayInlet
@@ -809,7 +812,23 @@ class WaterLayer(BaseLayer):
                     f"where={encoded_where}"
                 )
                 
-                response = requests.get(nhd_url, timeout=60) # Increased timeout for large queries
+                # Add headers to avoid 403 errors
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                    'Accept': 'application/json',
+                }
+                
+                response = requests.get(nhd_url, timeout=60, headers=headers)
+                if response.status_code == 403:
+                    print(f"Layer {layer}: 403 Forbidden - may be rate limited, waiting 5s...")
+                    import time
+                    time.sleep(5)
+                    response = requests.get(nhd_url, timeout=60, headers=headers)
+                
+                if response.status_code != 200:
+                    print(f"Layer {layer}: HTTP {response.status_code}")
+                    continue
+                    
                 if response.status_code == 200 and response.text:
                     try:
                         water_features = gpd.read_file(io.StringIO(response.text))
@@ -1002,10 +1021,10 @@ class WaterLayer(BaseLayer):
         
         # Get filtering parameters
         coastline_buffer = filter_config.get('coastline_buffer_degrees', 0.002)
-        max_water_area_km2 = filter_config.get('max_water_area_km2', 1000.0)
+        max_water_area_km2 = filter_config.get('max_water_area_km2', 5000.0)
         remove_large_bodies = filter_config.get('remove_large_bodies', True)
         preserve_rivers = filter_config.get('preserve_rivers', True)
-        river_max_width_km = filter_config.get('river_max_width_km', 2.0)
+        river_max_width_km = filter_config.get('river_max_width_km', 10.0)
         
         # Step 1: Create inland boundary by buffering from coastline
         inland_boundary = state_polygon.buffer(-coastline_buffer)
@@ -1015,18 +1034,28 @@ class WaterLayer(BaseLayer):
         filtered_features = []
         
         for idx, feature in water_features.iterrows():
-            # Calculate feature area in square kilometers
+            # Calculate feature area and perimeter in kilometers
             # Convert from degrees to km (approximate: 1 degree ≈ 111 km)
             feature_area_km2 = feature.geometry.area * (111.32 ** 2)
+            perimeter_km = feature.geometry.length * 111.32
             
             # Check if feature is within inland boundary
             is_inland = inland_boundary.contains(feature.geometry) or inland_boundary.intersects(feature.geometry)
             
-            # Determine if this is likely a river (narrow feature)
-            bounds = feature.geometry.bounds
-            width_km = (bounds[2] - bounds[0]) * 111.32  # longitude difference
-            height_km = (bounds[3] - bounds[1]) * 111.32  # latitude difference
-            is_likely_river = max(width_km, height_km) / min(width_km, height_km) > 3  # aspect ratio > 3:1
+            # Determine if this is likely a river using geometry-based metrics
+            # Compactness ratio: circle = 1, elongated shapes < 1
+            # Formula: 4 * pi * area / perimeter^2
+            if perimeter_km > 0:
+                compactness = (4 * np.pi * feature_area_km2) / (perimeter_km ** 2)
+                # Approximate average width: for elongated shape, width ≈ 2 * area / perimeter
+                approx_width_km = (2 * feature_area_km2) / perimeter_km
+            else:
+                compactness = 1.0
+                approx_width_km = 0
+            
+            # Rivers are elongated (low compactness) - lakes/ponds are more compact
+            # Compactness < 0.15 indicates elongated shape (river-like)
+            is_likely_river = compactness < 0.15
             
             # Apply filtering rules
             keep_feature = True
@@ -1035,17 +1064,17 @@ class WaterLayer(BaseLayer):
             if remove_large_bodies and feature_area_km2 > max_water_area_km2:
                 if not (preserve_rivers and is_likely_river):
                     keep_feature = False
-                    print(f"Removed large water body: {feature_area_km2:.1f} km²")
+                    print(f"Removed large water body: {feature_area_km2:.1f} km² (compactness: {compactness:.3f})")
             
             # Rule 2: Remove features that are primarily coastal
             if not is_inland and feature_area_km2 > 10:  # Only remove larger coastal features
-                keep_feature = False
+                #keep_feature = False
                 print(f"Removed coastal water feature: {feature_area_km2:.1f} km²")
             
-            # Rule 3: Preserve rivers even if they're large
-            if preserve_rivers and is_likely_river and max(width_km, height_km) < river_max_width_km:
+            # Rule 3: Preserve rivers even if they're large (check approximate width)
+            if preserve_rivers and is_likely_river and approx_width_km < river_max_width_km:
                 keep_feature = True
-                #print(f"Preserved river: {feature_area_km2:.1f} km²")
+                #print(f"Preserved river: {feature_area_km2:.1f} km², width: {approx_width_km:.2f} km, compactness: {compactness:.3f}")
             
             if keep_feature:
                 filtered_features.append(feature)

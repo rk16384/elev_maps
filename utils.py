@@ -64,7 +64,7 @@ def land_area_to_resolution(land_area: float) -> List[int]:
     # Target pixel area for high-quality visualization (4800x6000 pixels)
     # max print size
     max_print_size = 24 * 36 # square inches
-    dpi = 400 # high quality print
+    dpi = 300 # high quality print
     dpsi = dpi * dpi
     pixel_area = max_print_size * dpsi
 

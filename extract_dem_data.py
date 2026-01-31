@@ -43,9 +43,11 @@ def fetch_dem_from_3dep(bbox: tuple, resolution: int, timeout: int = 60):
     height = int((bbox[3] - bbox[1]) * deg_to_m / resolution)
     
     # Limit to ~16 million pixels to avoid server errors
-    if width * height > 16000000:
-        raise ValueError(f"Requested image size ({width}x{height}) is too large for {resolution}m resolution.")
-    
+    ignore_server_errors = True
+    if not ignore_server_errors:
+        if width * height > 16000000:
+            raise ValueError(f"Requested image size ({width}x{height}) is too large for {resolution}m resolution.")
+        
     params = {
         "bbox": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
         "bboxSR": "4326",
@@ -137,20 +139,27 @@ def extract_dem_for_polygon(polygon, output_path: str):
     return output_path
 
 
-def extract_dem_from_geojson(geojson_data: dict, output_path: str):
+def extract_dem_from_geojson(geojson_data: dict, output_path: str, polygon_coords: list = None):
     """
     Extract DEM data from a GeoJSON FeatureCollection.
     
     Args:
         geojson_data: GeoJSON dict with FeatureCollection containing a Polygon
         output_path: Path to save the output GeoTIFF
+        polygon_coords: Optional list of (lon, lat) tuples defining the extraction bounds.
+                        If provided, uses these coordinates instead of geojson_data for bounds.
         
     Returns:
         Tuple of (output_path, polygon) or (None, None) if failed
     """
-    # Extract the first polygon from the GeoJSON
-    first_feature = geojson_data["features"][0]
-    polygon = shape(first_feature["geometry"])
+    from shapely.geometry import Polygon
+    
+    # Use provided polygon_coords if available, otherwise extract from geojson
+    if polygon_coords is not None:
+        polygon = Polygon(polygon_coords)
+    else:
+        first_feature = geojson_data["features"][0]
+        polygon = shape(first_feature["geometry"])
     
     print("=" * 60)
     print("DEM Extraction")

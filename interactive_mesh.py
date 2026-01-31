@@ -106,9 +106,15 @@ class InteractiveMeshViewer:
         except Exception as e:
             print(f"Warning: Could not load settings: {e}")
     
-    def _create_polygon_mask(self) -> np.ndarray:
-        """Create a boolean mask from polygon coordinates."""
+    def _create_polygon_mask(self, erode_pixels: int = 2) -> np.ndarray:
+        """Create a boolean mask from polygon coordinates.
+        
+        Args:
+            erode_pixels: Number of pixels to erode from the boundary to remove
+                          edge artifacts from lighting calculations.
+        """
         from rasterio.features import geometry_mask
+        from scipy.ndimage import binary_erosion
         from shapely.geometry import Polygon
         
         if self.polygon_coords is None:
@@ -123,6 +129,11 @@ class InteractiveMeshViewer:
             transform=self.transform,
             invert=False
         )
+        
+        # Erode mask to remove boundary pixels with incomplete neighbor data
+        if erode_pixels > 0:
+            mask = binary_erosion(mask, iterations=erode_pixels)
+        
         return mask
         
     def _create_mesh(self):
@@ -130,12 +141,20 @@ class InteractiveMeshViewer:
         # Apply gaussian smoothing
         smoothed = gaussian_filter(self.dem_data, sigma=self.params["smoothing_sigma"])
         
-        # Create coordinate grids
+        # Create coordinate grids in real-world units (meters)
         nrows, ncols = smoothed.shape
         
-        # Use pixel coordinates scaled to preserve aspect ratio
-        x = np.linspace(0, ncols, ncols)
-        y = np.linspace(0, nrows, nrows)
+        # Calculate pixel size in meters (approximate using center latitude)
+        center_lat = (self.bounds.top + self.bounds.bottom) / 2
+        deg_to_m_lat = 111320  # meters per degree latitude
+        deg_to_m_lon = 111320 * np.cos(np.radians(center_lat))  # meters per degree longitude
+        
+        pixel_width_m = abs(self.transform.a) * deg_to_m_lon
+        pixel_height_m = abs(self.transform.e) * deg_to_m_lat
+        
+        # Create coordinate grids in meters
+        x = np.linspace(0, ncols * pixel_width_m, ncols)
+        y = np.linspace(0, nrows * pixel_height_m, nrows)
         x, y = np.meshgrid(x, y)
         
         # Flip y to match geographic orientation (north up)
@@ -156,7 +175,8 @@ class InteractiveMeshViewer:
         if self.polygon_coords is not None:
             # Get cell validity based on points
             point_valid = ~np.isnan(mesh.points[:, 2])
-            mesh = mesh.extract_points(point_valid)
+            # adjacent_cells=False ensures only cells with ALL valid vertices are kept
+            mesh = mesh.extract_points(point_valid, adjacent_cells=False)
         
         return mesh
     
@@ -524,6 +544,44 @@ def load_polygon_from_geojson(geojson_path: Path) -> list:
     polygon = shape(first_feature["geometry"])
     return list(polygon.exterior.coords)
 
+def load_radius_from_geojson(polygon_coords: list) -> list:
+    """
+    Create a circular polygon from center point and radius point.
+    
+    Accounts for latitude-dependent scaling of longitude to produce
+    a true circle in real-world coordinates.
+    """
+    # First two points: center and a point on the radius
+    center = polygon_coords[0]  # (lon, lat)
+    radius_point = polygon_coords[1]
+    
+    center_lon, center_lat = center
+    
+    # Conversion factors (meters per degree)
+    deg_to_m_lat = 111320
+    deg_to_m_lon = 111320 * np.cos(np.radians(center_lat))
+    
+    # Calculate radius in meters
+    delta_lon = radius_point[0] - center_lon
+    delta_lat = radius_point[1] - center_lat
+    delta_x_m = delta_lon * deg_to_m_lon
+    delta_y_m = delta_lat * deg_to_m_lat
+    radius_m = np.sqrt(delta_x_m**2 + delta_y_m**2)
+    
+    # Generate circle points in meters, then convert back to degrees
+    N = 100
+    theta = np.linspace(0, 2 * np.pi, N)
+    
+    # Offsets in meters
+    x_offset_m = radius_m * np.cos(theta)
+    y_offset_m = radius_m * np.sin(theta)
+    
+    # Convert back to degrees (with proper scaling)
+    lon = center_lon + x_offset_m / deg_to_m_lon
+    lat = center_lat + y_offset_m / deg_to_m_lat
+    
+    return list(zip(lon, lat))
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -539,8 +597,14 @@ Example:
     parser.add_argument(
         "location_name",
         nargs="?",
-        default="breck",
+        default="mt-baker",
         help="Name of the location folder inside mountain_mesh_data/ (default: brighton)",
+    )
+    parser.add_argument(
+        "method",
+        nargs="?",
+        default="radius",
+        help="Method of defining the area: polygon, radius"
     )
     args = parser.parse_args()
     
@@ -570,12 +634,14 @@ Example:
     with open(polygon_file, "r") as f:
         geojson_data = json.load(f)
     polygon_coords = load_polygon_from_geojson(polygon_file)
+    if args.method == "radius":
+        polygon_coords = load_radius_from_geojson(polygon_coords)
     print(f"Loaded polygon with {len(polygon_coords)} vertices")
     
     # Check if DEM exists, if not extract it
     if not dem_file.exists():
         print(f"\nDEM not found. Extracting DEM data...")
-        result, _ = extract_dem_from_geojson(geojson_data, str(dem_file))
+        result, _ = extract_dem_from_geojson(geojson_data, str(dem_file), polygon_coords)
         if result is None:
             print("Error: Failed to extract DEM data.")
             return 1

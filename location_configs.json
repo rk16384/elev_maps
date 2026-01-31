@@ -62,6 +62,14 @@
             "water_color": [2, 6, 83],
             "gaussian_blur_sigma": 0.0,
             "vertical_exaggeration": 7.0
+        },
+            "cache": {
+            "dem": true,
+            "state_boundary": true,
+            "hillshade": true,
+            "elevation_coloring": true,
+            "water": true,
+            "shadow": false
         }
     },
     "Michigan": {
@@ -146,6 +154,55 @@
             "elevation_coloring": false,
             "water": true,
             "shadow": true
+        }
+    },
+    "Minnesota": {
+        "type": "state",
+        "clip_to_shoreline": true,
+        "common": {
+            "transparent_background": true,
+            "do_hillshade": true,
+            "do_elevation_coloring": false
+        },
+        "hillshade_config": {
+            "vertical_exaggeration": 50,
+            "sun_azimuth": 315,
+            "sun_altitude": 70,
+            "include_water": true,
+            "water_color": [0, 105, 105],
+            "transparent_background": true,
+            "gaussian_blur_sigma": 0.0
+        },
+        "water_filter_config": {
+            "coastline_buffer_degrees": 0.002,
+            "max_water_area_km2": 5000.0,
+            "remove_large_bodies": false,
+            "preserve_rivers": true,
+            "river_max_width_km": 10.0
+        },
+        "elevation_coloring_config": {
+            "low_color": [0, 0, 255],
+            "high_color": [255, 239, 160],
+            "use_percentiles": true,
+            "percentile_range": [0.0001, 99],
+            "color_method": "gradient",
+            "water_color": [2, 6, 83],
+            "gaussian_blur_sigma": 0.0,
+            "vertical_exaggeration": 15.0
+        },
+        "cache": {
+            "dem": true,
+            "state_boundary": false,
+            "hillshade": true,
+            "elevation_coloring": true,
+            "water": true,
+            "shadow": true
+        },
+        "shadow_config": {
+            "light_elevation_deg": 70,
+            "light_azimuth": 315,
+            "scale": 0.2,
+            "transparent_background": true
         }
     },
     "Astoria": {

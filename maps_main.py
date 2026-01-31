@@ -14,6 +14,8 @@ import xarray
 from affine import Affine
 from rvt import vis as rvt_vis
 from scipy.ndimage import gaussian_filter
+from rasterio.fill import fillnodata
+from rasterio.features import rasterize
 
 def create_debug_grid_image(hillshade_img, tiles, dem_crs, dem_transform):
     """
@@ -110,6 +112,106 @@ def norm_hillshade(dem, sun_azimuth, sun_altitude):
     hillshade_data = hillshade.data.squeeze()
 
     return hillshade_data
+
+
+def interpolate_dem_nodata(dem_data, location_polygon, max_search_distance=1000):
+    """
+    Interpolate NaN and -9999 nodata values within a boundary polygon.
+    
+    Args:
+        dem_data: xarray DataArray with elevation data
+        location_polygon: Shapely polygon defining the boundary (in EPSG:4326)
+        max_search_distance: Maximum pixels to search for valid data during interpolation
+    
+    Returns:
+        Updated dem_data with interpolated values inside the boundary
+    """
+    dem_values = dem_data.values.squeeze().astype(np.float32)
+    
+    # Treat -9999 as nodata
+    nodata_mask = dem_values == -9999
+    if nodata_mask.any():
+        print(f"Converting {nodata_mask.sum():,} pixels with -9999 to NaN...")
+        dem_values[nodata_mask] = np.nan
+    
+    # Treat values at or very close to 0.0 as nodata (use small threshold for float precision)
+    zero_mask = np.abs(dem_values) < 0.0001
+    if zero_mask.any():
+        print(f"Converting {zero_mask.sum():,} pixels with ~0.0 elevation to NaN...")
+        dem_values[zero_mask] = np.nan
+    
+    nan_count_before = np.isnan(dem_values).sum()
+    
+    if nan_count_before > 0:
+        print(f"Found {nan_count_before:,} NaN pixels in DEM, interpolating within boundary...")
+        
+        # Create a mask of pixels within the boundary
+        transform = dem_data.rio.transform()
+        dem_crs = dem_data.rio.crs
+        
+        # Reproject polygon to DEM CRS
+        state_gdf = gpd.GeoDataFrame(geometry=[location_polygon], crs="EPSG:4326")
+        state_gdf_proj = state_gdf.to_crs(dem_crs)
+        polygon_proj = state_gdf_proj.geometry.iloc[0]
+        
+        # Rasterize the boundary to create a mask (1 = inside, 0 = outside)
+        boundary_mask = rasterize(
+            [(polygon_proj, 1)],
+            out_shape=dem_values.shape,
+            transform=transform,
+            fill=0,
+            dtype=np.uint8
+        )
+        
+        # Identify NaN pixels inside the boundary that need filling
+        interior_nan_mask = (boundary_mask == 1) & np.isnan(dem_values)
+        # save interior_nan_mask to image
+        save_to_image(interior_nan_mask, 'interior_nan_mask_debug', map_data)
+        interior_nan_count = interior_nan_mask.sum()
+        print(f"  NaN pixels inside boundary: {interior_nan_count:,}")
+        
+        # Create working copy with outside-boundary pixels set to mean interior elevation
+        # This gives fillnodata valid "edges" to interpolate from
+        dem_work = dem_values.copy()
+        interior_valid = (boundary_mask == 1) & ~np.isnan(dem_values)
+        if interior_valid.any():
+            mean_interior = np.nanmean(dem_values[boundary_mask == 1])
+            # Set outside boundary to mean value (provides interpolation boundary)
+            dem_work[boundary_mask == 0] = mean_interior
+        
+        # Now fillnodata only needs to fill interior gaps
+        valid_data_mask = ~np.isnan(dem_work)
+        
+        dem_filled = fillnodata(
+            dem_work,
+            mask=valid_data_mask,
+            max_search_distance=max_search_distance,
+            smoothing_iterations=2  # smooth edges after interpolation
+        )
+        
+        # Apply filled values only to interior NaN pixels, keep original elsewhere
+        dem_values_new = np.where(
+            interior_nan_mask,
+            dem_filled,
+            dem_values
+        )
+
+        
+        nan_count_after = np.isnan(dem_values_new).sum()
+        interior_nan_remaining = ((boundary_mask == 1) & np.isnan(dem_values_new)).sum()
+        nan_filled = nan_count_before - nan_count_after
+        print(f"Interpolated {nan_filled:,} NaN pixels")
+        print(f"  Interior NaN remaining: {interior_nan_remaining:,}")
+        print(f"  Outside boundary NaN: {nan_count_after - interior_nan_remaining:,}")
+        dem_values = dem_values_new
+    
+    # Update the DEM data
+    if len(dem_data.shape) == 3:
+        dem_data.values[0] = dem_values
+    else:
+        dem_data.values[:] = dem_values
+    
+    return dem_data
 
      
 import math
@@ -343,6 +445,10 @@ def create_land_mask_smart_water_detection(dem_data: xarray.DataArray,
     # Water typically has elevation = 0 or very close to 0
     sea_level_mask = np.abs(elevation) < 0.5  # Within 0.5m of sea level
     land_mask = land_mask & ~sea_level_mask
+
+    # save land mask to image
+    save_to_image(land_mask, 'land_mask_debug', map_data)
+    save_to_image(sea_level_mask, 'sea_level_mask_debug', map_data)
     
     # Method 2: Remove large flat areas that are likely water bodies
     # Use simple local variation to find flat areas
@@ -415,6 +521,7 @@ def create_printable_map(map_data: MapData,
 
     # Calculate title space (x% of height or minimum y inch)
     title_height_px = max(int(height_px * 0.06), int(.6 * dpi))
+    title_height_px = 0.01
     
     # Calculate available space for hillshade
     available_width = width_px - (2 * margin_px)
@@ -653,6 +760,13 @@ def generate_map(create_debug_grid=False,
         if map_data.use_cache_dem:
             map_data.save_to_cache('dem', map_data.dem_data)
     
+    # Interpolate NaN values within state boundary
+    map_data.dem_data = interpolate_dem_nodata(
+        map_data.dem_data,
+        map_data.location_polygon,
+        max_search_distance=1000
+    )
+    
     # Check if DEM needs downsampling
     max_pixels = 24 * 30 * 300 * 300  # 50 million pixels (adjust as needed)
     dem_shape = map_data.dem_data.shape
@@ -680,6 +794,14 @@ def generate_map(create_debug_grid=False,
 
     # Reproject DEM to Web Mercator for accurate distance calculations
     map_data.dem_data = reproject_to_web_mercator(map_data.dem_data)
+
+    # DEBUGsave dem data to image
+    dem_values = map_data.dem_data.values.squeeze()
+    # Normalize to 0-255
+    dem_min, dem_max = np.nanmin(dem_values), np.nanmax(dem_values)
+    dem_normalized = (dem_values - dem_min) / (dem_max - dem_min) * 255
+    dem_normalized = np.nan_to_num(dem_normalized, nan=0).astype(np.uint8)
+    save_to_image(dem_normalized, 'dem_data_debug', map_data)
 
     # --- STATE BOUNDARY/MASK ---
     if map_data.common_config['transparent_background'] and map_data.location_type == 'state':
@@ -742,6 +864,9 @@ def generate_map(create_debug_grid=False,
             water_filter_config=water_filter_config
         )
 
+        # save water mask to image
+        save_to_image(map_data.water_mask, 'water_mask_debug', map_data)
+
     # TEST ___________________
     # Debug: save raw DEM as image to check for artifacts
     # from PIL import Image
@@ -761,12 +886,19 @@ def generate_map(create_debug_grid=False,
             map_data.hillshade = map_data.load_from_cache('hillshade')
         else:
             print("Creating hillshade...")
-            map_data.hillshade = create_hillshade(
-                dem_data=map_data.dem_data,
-                sun_azimuth=map_data.hillshade_config['sun_azimuth'],
-                sun_altitude=map_data.hillshade_config['sun_altitude'],
-                vertical_exaggeration=map_data.hillshade_config['vertical_exaggeration']
-            )
+            try:
+                map_data.hillshade = create_hillshade(
+                    dem_data=map_data.dem_data,
+                    sun_azimuth=map_data.hillshade_config['sun_azimuth'],
+                    sun_altitude=map_data.hillshade_config['sun_altitude'],
+                    vertical_exaggeration=map_data.hillshade_config['vertical_exaggeration']
+                )
+                print("Hillshade created successfully")
+            except Exception as e:
+                print(f"Hillshade creation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
             
             if map_data.use_cache_hillshade:
                 map_data.save_to_cache('hillshade', map_data.hillshade)
@@ -947,7 +1079,7 @@ def downsample_dem(
 
 if __name__ == "__main__":
     # Example usage for a state
-    title = "Utah"
+    title = ""
     sun_azimuth = 300
     sun_altitude = 65
     land_only = True  # Set to False to include state marine/Great Lakes territory
@@ -962,7 +1094,7 @@ if __name__ == "__main__":
     from map_data import MapData
 
     base_dir = "/Volumes/sandisk1"
-    location = "Utah"
+    location = "Oregon"
     map_data = MapData(location_name=location, base_dir=base_dir)
 
 
@@ -989,15 +1121,20 @@ if __name__ == "__main__":
         map_data=map_data,
         title=title,
         output_prefix=printable_base,
-        width_inches=20.0,
-        height_inches=30.0,
+        width_inches=25.0,
+        height_inches=20.0,
         margin_inches=0.5,
         dpi=500, # 2400
         border=False,
-        shadow=False,
+        shadow=True,
         input_font=font_file,
         font_index=font_idx
     )
+
+    # Michigan : 3:4 -> 24x32
+    # Utah: 2:3 -> 20x30
+    # Oregon: 5:4 or 4:3
+    # Minnesota: 3:4 -> 24x32
     print(f"Generated printable map versions:")
     print(f"PDF: {pdf_path}")
     print(f"High-res image: {png_path}")
