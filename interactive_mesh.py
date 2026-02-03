@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 import rasterio
+from PIL import Image
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import shape
 
@@ -34,9 +35,10 @@ BASE_DIR = Path(__file__).parent / "mountain_mesh_data"
 
 
 class InteractiveMeshViewer:
-    def __init__(self, location_dir: Path, polygon_coords: list):
+    def __init__(self, location_dir: Path, polygon_coords: list, method: str = "radius"):
         self.location_dir = location_dir
         self.polygon_coords = polygon_coords
+        self.method = method
         
         self.dem_path = location_dir / "extracted_dem.tif"
         self.settings_file = location_dir / "mesh_settings.json"
@@ -44,6 +46,7 @@ class InteractiveMeshViewer:
         self.dem_data = None
         self.transform = None
         self.mesh = None
+        self.base_mesh = None  # Store unrotated mesh for rotation
         self.plotter = None
         self.light = None
         self.actor = None
@@ -55,10 +58,16 @@ class InteractiveMeshViewer:
             "light_elevation": 45.0,
             "light_azimuth": 315.0,
             "light_distance": 10000.0,
+            "z_rotation": 0.0,  # Z-axis rotation in degrees
+            "pixel_min": 2,  # Minimum pixel value for mesh (background stays white)
+            "pixel_max": 253,  # Maximum pixel value for mesh
         }
         
         # Stored camera settings (loaded from file)
         self.saved_camera = None
+        
+        # Stored window size (loaded from file)
+        self.saved_window_size = None
         
         # Load DEM data
         self._load_dem()
@@ -102,6 +111,11 @@ class InteractiveMeshViewer:
             if "camera" in settings:
                 self.saved_camera = settings["camera"]
                 print("  Camera settings will be restored on startup.")
+            
+            # Store window size to apply when creating plotter
+            if "window_size" in settings:
+                self.saved_window_size = tuple(settings["window_size"])
+                print(f"  Window size will be restored: {self.saved_window_size}")
                 
         except Exception as e:
             print(f"Warning: Could not load settings: {e}")
@@ -210,8 +224,11 @@ class InteractiveMeshViewer:
         if self.actor is not None:
             self.plotter.remove_actor(self.actor)
         
-        # Create new mesh
+        # Create new mesh and apply Z rotation
         self.mesh = self._create_mesh()
+        self.mesh = self.mesh.rotate_z(
+            self.params["z_rotation"], point=self.mesh.center, inplace=False
+        )
         
         # Add mesh with white color
         self.actor = self.plotter.add_mesh(
@@ -263,6 +280,11 @@ class InteractiveMeshViewer:
         self.params["light_distance"] = value
         self._update_light()
     
+    def _on_z_rotation(self, value):
+        """Callback for Z rotation slider."""
+        self.params["z_rotation"] = value
+        self._update_mesh()
+    
     def _save_settings(self):
         """Save current settings and camera position to file and print to terminal."""
         # Get camera information
@@ -277,11 +299,15 @@ class InteractiveMeshViewer:
             "parallel_projection": camera.parallel_projection,
         }
         
+        # Get current window size
+        window_size = list(self.plotter.window_size)
+        
         # Full settings dict
         settings = {
             "dem_path": str(self.dem_path),
             "parameters": self.params.copy(),
             "camera": camera_info,
+            "window_size": window_size,
             "timestamp": datetime.now().isoformat(),
         }
         
@@ -299,6 +325,7 @@ class InteractiveMeshViewer:
         print(f"  view_up: {camera_info['view_up']}")
         print(f"  view_angle: {camera_info['view_angle']}")
         print(f"  parallel_projection: {camera_info['parallel_projection']}")
+        print(f"\nWindow Size: {window_size[0]}x{window_size[1]}")
         print("=" * 60 + "\n")
         
         # Save to file
@@ -335,66 +362,211 @@ class InteractiveMeshViewer:
         
         resolution = (out_width, out_height)
         
-        # Create off-screen plotter with matching aspect ratio
-        plotter = pv.Plotter(off_screen=True, lighting="none", window_size=resolution)
-        plotter.set_background("white")
-        
-        # Recreate mesh with current settings
+        # Recreate mesh with current settings and apply Z rotation
         mesh = self._create_mesh()
-        
-        # Add mesh
-        plotter.add_mesh(
-            mesh,
-            color="white",
-            smooth_shading=True,
-            specular=0.0,
-            diffuse=1.0,
-            ambient=0.1,
-        )
-        
-        # Add point light with current settings
+        mesh = mesh.rotate_z(self.params["z_rotation"], point=mesh.center, inplace=False)
+        self.mesh = mesh  # so _calculate_light_position uses mesh center
         light_pos = self._calculate_light_position()
-        light = pv.Light(
-            position=light_pos,
-            focal_point=mesh.center,
-            color="white",
-            intensity=1.0,
-            positional=True,
+        
+        def create_plotter(background_color):
+            """Helper to create a configured plotter with given background."""
+            plotter = pv.Plotter(off_screen=True, lighting="none", window_size=resolution)
+            plotter.set_background(background_color)
+            
+            plotter.add_mesh(
+                mesh,
+                color="white",
+                smooth_shading=True,
+                specular=0.0,
+                diffuse=1.0,
+                ambient=0.1,
+            )
+            
+            # Add point light with current settings
+            light = pv.Light(
+                position=light_pos,
+                focal_point=mesh.center,
+                color="white",
+                intensity=1.0,
+                positional=True,
+            )
+            plotter.add_light(light)
+            
+            # Add ambient light
+            ambient_light = pv.Light(
+                light_type="headlight",
+                intensity=0.1,
+            )
+            plotter.add_light(ambient_light)
+            
+            # Set camera to match current view exactly
+            plotter.camera.position = camera_info["position"]
+            plotter.camera.focal_point = camera_info["focal_point"]
+            plotter.camera.up = camera_info["view_up"]
+            plotter.camera.view_angle = camera_info["view_angle"]
+            plotter.camera.clipping_range = camera_info["clipping_range"]
+            
+            if camera_info["parallel_projection"]:
+                plotter.camera.parallel_projection = True
+                plotter.camera.parallel_scale = camera_info["parallel_scale"]
+            
+            return plotter
+        
+        # First render: use magenta background to create mask
+        # Magenta (255, 0, 255) won't appear in grayscale mesh rendering
+        mask_plotter = create_plotter((255, 0, 255))
+        mask_img = mask_plotter.screenshot(return_img=True)
+        mask_plotter.close()
+        
+        # Create mask: pixels that are NOT magenta are mesh pixels
+        # Check for exact magenta background color
+        is_magenta = (
+            (mask_img[..., 0] == 255) & 
+            (mask_img[..., 1] == 0) & 
+            (mask_img[..., 2] == 255)
         )
-        plotter.add_light(light)
+        mesh_mask = ~is_magenta
         
-        # Add ambient light
-        ambient_light = pv.Light(
-            light_type="headlight",
-            intensity=0.1,
-        )
-        plotter.add_light(ambient_light)
+        # Second render: white background for actual image
+        img_plotter = create_plotter("white")
+        img = img_plotter.screenshot(return_img=True)
+        img_plotter.close()
         
-        # Set camera to match current view exactly
-        plotter.camera.position = camera_info["position"]
-        plotter.camera.focal_point = camera_info["focal_point"]
-        plotter.camera.up = camera_info["view_up"]
-        plotter.camera.view_angle = camera_info["view_angle"]
-        plotter.camera.clipping_range = camera_info["clipping_range"]
+        # Post-process to constrain mesh pixel values to [pixel_min, pixel_max]
+        # while keeping background white (255)
+        img = self._remap_pixel_values(img, mesh_mask)
         
-        if camera_info["parallel_projection"]:
-            plotter.camera.parallel_projection = True
-            plotter.camera.parallel_scale = camera_info["parallel_scale"]
+        # Center the mesh in the frame with equal borders on all sides
+        img = self._center_mesh_in_frame(img, mesh_mask)
         
         # Generate timestamp for filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = self.location_dir / f"mesh_render_{timestamp}.png"
         
-        # Take screenshot at high resolution
-        plotter.screenshot(
-            str(output_path),
-            return_img=False,
-        )
-        
-        plotter.close()
+        # Save the processed image
+        Image.fromarray(img).save(str(output_path))
         
         print(f"High-resolution image saved to: {output_path.absolute()}")
         print(f"  Resolution: {resolution[0]}x{resolution[1]}")
+        print(f"  Mesh pixel range: [{self.params['pixel_min']}, {self.params['pixel_max']}]")
+    
+    def _remap_pixel_values(self, img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        Remap mesh pixel values to [pixel_min, pixel_max] range while keeping background white.
+        
+        Args:
+            img: RGB image array from PyVista screenshot
+            mask: Boolean array where True = mesh pixel, False = background
+            
+        Returns:
+            Processed image with mesh values remapped
+        """
+        pixel_min = self.params["pixel_min"]
+        pixel_max = self.params["pixel_max"]
+        
+        # Convert to grayscale for processing (mesh is rendered as grayscale anyway)
+        # Use luminosity method: 0.299*R + 0.587*G + 0.114*B
+        gray = np.dot(img[..., :3], [0.299, 0.587, 0.114]).astype(np.float32)
+        
+        if not np.any(mask):
+            # No mesh pixels found, return white image
+            return np.full_like(img, 255)
+        
+        # Get the actual value range of mesh pixels
+        mesh_values = gray[mask]
+        actual_min = mesh_values.min()
+        actual_max = mesh_values.max()
+        
+        print(f"  Original mesh pixel range: [{actual_min:.1f}, {actual_max:.1f}]")
+        
+        # Remap mesh values from [actual_min, actual_max] to [pixel_min, pixel_max]
+        # Avoid division by zero if all mesh pixels have the same value
+        if actual_max - actual_min < 0.001:
+            remapped = np.full_like(gray, (pixel_min + pixel_max) / 2)
+        else:
+            remapped = (gray - actual_min) / (actual_max - actual_min)
+            remapped = remapped * (pixel_max - pixel_min) + pixel_min
+        
+        # Set background to white
+        remapped[~mask] = 255.0
+        
+        # Clip and convert to uint8
+        remapped = np.clip(remapped, 0, 255).astype(np.uint8)
+        
+        # Convert back to RGB (grayscale)
+        result = np.stack([remapped, remapped, remapped], axis=-1)
+        
+        # Preserve alpha channel if present
+        if img.shape[-1] == 4:
+            result = np.concatenate([result, img[..., 3:4]], axis=-1)
+        
+        return result
+    
+    def _center_mesh_in_frame(self, img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        Center the mesh in the frame with equal borders on all sides.
+        
+        Args:
+            img: RGB image array (already remapped)
+            mask: Boolean array where True = mesh pixel, False = background
+            
+        Returns:
+            Image with mesh centered, background filled with white
+        """
+        if not np.any(mask):
+            return img
+        
+        # Find bounding box of mesh pixels
+        rows_with_mesh = np.any(mask, axis=1)
+        cols_with_mesh = np.any(mask, axis=0)
+        
+        row_indices = np.where(rows_with_mesh)[0]
+        col_indices = np.where(cols_with_mesh)[0]
+        
+        top = row_indices[0]
+        bottom = row_indices[-1]
+        left = col_indices[0]
+        right = col_indices[-1]
+        
+        # Calculate mesh dimensions and current center
+        mesh_height = bottom - top + 1
+        mesh_width = right - left + 1
+        mesh_center_y = (top + bottom) / 2
+        mesh_center_x = (left + right) / 2
+        
+        # Calculate image center
+        img_height, img_width = img.shape[:2]
+        img_center_y = img_height / 2
+        img_center_x = img_width / 2
+        
+        # Calculate shift needed to center the mesh
+        shift_y = int(round(img_center_y - mesh_center_y))
+        shift_x = int(round(img_center_x - mesh_center_x))
+        
+        print(f"  Mesh bounding box: ({left}, {top}) to ({right}, {bottom})")
+        print(f"  Mesh size: {mesh_width}x{mesh_height}")
+        print(f"  Centering shift: ({shift_x}, {shift_y})")
+        
+        # Create new white image
+        centered = np.full_like(img, 255)
+        
+        # Calculate source and destination regions
+        # Source region (from original image)
+        src_y1 = max(0, -shift_y)
+        src_y2 = min(img_height, img_height - shift_y)
+        src_x1 = max(0, -shift_x)
+        src_x2 = min(img_width, img_width - shift_x)
+        
+        # Destination region (in centered image)
+        dst_y1 = max(0, shift_y)
+        dst_y2 = min(img_height, img_height + shift_y)
+        dst_x1 = max(0, shift_x)
+        dst_x2 = min(img_width, img_width + shift_x)
+        
+        # Copy the content
+        centered[dst_y1:dst_y2, dst_x1:dst_x2] = img[src_y1:src_y2, src_x1:src_x2]
+        
+        return centered
         
     def _on_key_press(self):
         """Handle key press events."""
@@ -402,12 +574,18 @@ class InteractiveMeshViewer:
     
     def run(self):
         """Launch the interactive viewer."""
-        # Create plotter
-        self.plotter = pv.Plotter(lighting="none")
+        # Create plotter with saved window size if available
+        if self.saved_window_size is not None:
+            self.plotter = pv.Plotter(lighting="none", window_size=self.saved_window_size)
+        else:
+            self.plotter = pv.Plotter(lighting="none")
         self.plotter.set_background("white")
         
-        # Create initial mesh
+        # Create initial mesh and apply Z rotation
         self.mesh = self._create_mesh()
+        self.mesh = self.mesh.rotate_z(
+            self.params["z_rotation"], point=self.mesh.center, inplace=False
+        )
         
         # Add mesh
         self.actor = self.plotter.add_mesh(
@@ -437,8 +615,8 @@ class InteractiveMeshViewer:
         )
         self.plotter.add_light(ambient_light)
         
-        # Add sliders
-        slider_y_positions = [0.9, 0.8, 0.7, 0.6, 0.5]
+        # Add sliders (left column)
+        slider_y_positions = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
         
         self.plotter.add_slider_widget(
             self._on_vertical_exaggeration,
@@ -487,6 +665,16 @@ class InteractiveMeshViewer:
             title="Light Distance",
             pointa=(0.02, slider_y_positions[4]),
             pointb=(0.25, slider_y_positions[4]),
+            style="modern",
+        )
+        
+        self.plotter.add_slider_widget(
+            self._on_z_rotation,
+            rng=[0.0, 360.0],
+            value=self.params["z_rotation"],
+            title="Z Rotation",
+            pointa=(0.02, slider_y_positions[5]),
+            pointb=(0.25, slider_y_positions[5]),
             style="modern",
         )
         
@@ -597,7 +785,7 @@ Example:
     parser.add_argument(
         "location_name",
         nargs="?",
-        default="mt-baker",
+        default="crater-lake",
         help="Name of the location folder inside mountain_mesh_data/ (default: brighton)",
     )
     parser.add_argument(
