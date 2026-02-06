@@ -785,13 +785,13 @@ Example:
     parser.add_argument(
         "location_name",
         nargs="?",
-        default="crater-lake",
+        default="tetons",
         help="Name of the location folder inside mountain_mesh_data/ (default: brighton)",
     )
     parser.add_argument(
         "method",
         nargs="?",
-        default="radius",
+        default="polygon",
         help="Method of defining the area: polygon, radius"
     )
     args = parser.parse_args()

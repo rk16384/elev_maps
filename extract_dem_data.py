@@ -10,6 +10,7 @@ Can be used as a standalone script or imported as a module.
 import io
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -20,14 +21,15 @@ from shapely.geometry import shape
 from utils import bbox_to_land_area, land_area_to_resolution
 
 
-def fetch_dem_from_3dep(bbox: tuple, resolution: int, timeout: int = 60):
+def fetch_dem_from_3dep(bbox: tuple, resolution: int, timeout: int = 120, max_retries: int = 3):
     """
-    Fetch DEM data from USGS 3DEP service.
+    Fetch DEM data from USGS 3DEP service with retry logic.
     
     Args:
         bbox: (west, south, east, north) bounding box in EPSG:4326
         resolution: Resolution in meters
-        timeout: Request timeout in seconds
+        timeout: Request timeout in seconds (default 120s for larger requests)
+        max_retries: Maximum number of retry attempts for timeout/network errors
         
     Returns:
         xarray.DataArray of DEM data
@@ -61,23 +63,59 @@ def fetch_dem_from_3dep(bbox: tuple, resolution: int, timeout: int = 60):
     }
     
     print(f"  Requesting {width}x{height} pixels...")
-    response = requests.get(base_url, params=params, timeout=timeout)
-    response.raise_for_status()
     
-    # Check if the response is actually an image
-    content_type = response.headers.get("Content-Type", "")
-    if "image" not in content_type:
-        raise ValueError(f"Server did not return an image. Content-Type: {content_type}")
+    # Retry loop for timeout and network errors
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(base_url, params=params, timeout=timeout)
+            response.raise_for_status()
+            
+            # Check if the response is actually an image
+            content_type = response.headers.get("Content-Type", "")
+            if "image" not in content_type:
+                raise ValueError(f"Server did not return an image. Content-Type: {content_type}")
+            
+            # Read the image data into rioxarray
+            with rioxarray.open_rasterio(io.BytesIO(response.content)) as rds:
+                dem_data = rds.squeeze(drop=True).copy()
+            
+            # Validate the data
+            if dem_data.ndim < 2 or min(dem_data.shape) < 2:
+                raise ValueError(f"Invalid DEM data shape: {dem_data.shape}")
+            
+            return dem_data
+            
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
+                print(f"  Timeout/connection error, retrying in {wait_time}s (attempt {attempt + 2}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                print(f"  All {max_retries} attempts failed.")
+                raise
+        except requests.exceptions.HTTPError as e:
+            # Retry on 502 Bad Gateway and 504 Gateway Timeout (transient server issues)
+            if e.response is not None and e.response.status_code in (502, 504):
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 10  # Longer backoff for server errors: 10s, 20s, 40s
+                    print(f"  Server timeout ({e.response.status_code}), retrying in {wait_time}s (attempt {attempt + 2}/{max_retries})...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  All {max_retries} attempts failed with server timeout.")
+                    raise
+            else:
+                # Don't retry other HTTP errors (4xx, 500, etc.)
+                raise
+        except ValueError:
+            # Don't retry validation errors - the data is bad, not the connection
+            raise
     
-    # Read the image data into rioxarray
-    with rioxarray.open_rasterio(io.BytesIO(response.content)) as rds:
-        dem_data = rds.squeeze(drop=True).copy()
-    
-    # Validate the data
-    if dem_data.ndim < 2 or min(dem_data.shape) < 2:
-        raise ValueError(f"Invalid DEM data shape: {dem_data.shape}")
-    
-    return dem_data
+    # Should not reach here, but just in case
+    if last_exception:
+        raise last_exception
 
 
 def extract_dem_for_polygon(polygon, output_path: str):
