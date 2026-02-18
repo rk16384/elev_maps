@@ -368,7 +368,7 @@ def main() -> int:
     parser.add_argument(
         "name",
         nargs="?",
-        default="brighton",
+        default="tetons",
         help="Folder name within mountain_mesh_data/ (e.g., mt-baker)",
     )
     args = parser.parse_args()

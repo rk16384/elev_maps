@@ -27,7 +27,7 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import shape
 
-from extract_dem_data import extract_dem_from_geojson
+from extract_dem_data import extract_dem_from_geojson, extract_dem_mosaic_from_geojson
 
 
 # Base directory for all location data
@@ -75,18 +75,58 @@ class InteractiveMeshViewer:
         # Load previous settings if available
         self._load_settings()
         
-    def _load_dem(self):
-        """Load DEM data from file."""
+    def _load_dem(self, max_mesh_dimension: int = 2000):
+        """
+        Load DEM data from file, downsampling if too large for interactive viewing.
+        
+        Args:
+            max_mesh_dimension: Maximum dimension (width or height) for the mesh.
+                               Larger DEMs will be downsampled to prevent memory issues.
+                               Default: 2000 (4 million point mesh max)
+        """
         with rasterio.open(self.dem_path) as src:
             self.dem_data = src.read(1).astype(np.float32)
             self.transform = src.transform
             self.bounds = src.bounds
             self.crs = src.crs
+        
+        original_shape = self.dem_data.shape
+        
+        # Downsample if DEM is too large for interactive mesh viewing
+        current_max = max(self.dem_data.shape)
+        if current_max > max_mesh_dimension:
+            from scipy.ndimage import zoom
+            
+            scale_factor = max_mesh_dimension / current_max
+            new_height = int(self.dem_data.shape[0] * scale_factor)
+            new_width = int(self.dem_data.shape[1] * scale_factor)
+            
+            print(f"Downsampling DEM for interactive viewing: {self.dem_data.shape[1]}x{self.dem_data.shape[0]} -> {new_width}x{new_height}")
+            
+            # Handle nodata before downsampling
+            nodata_mask = (self.dem_data == -9999) | np.isnan(self.dem_data)
+            self.dem_data[nodata_mask] = np.nan
+            
+            # Downsample using bilinear interpolation
+            self.dem_data = zoom(self.dem_data, scale_factor, order=1, mode='nearest')
+            
+            # Update transform to reflect new resolution
+            from affine import Affine
+            self.transform = Affine(
+                self.transform.a / scale_factor,
+                self.transform.b,
+                self.transform.c,
+                self.transform.d,
+                self.transform.e / scale_factor,
+                self.transform.f
+            )
             
         # Handle nodata values
         self.dem_data = np.nan_to_num(self.dem_data, nan=0.0)
         
         print(f"Loaded DEM: {self.dem_path}")
+        if original_shape != self.dem_data.shape:
+            print(f"  Original shape: {original_shape}")
         print(f"  Shape: {self.dem_data.shape}")
         print(f"  Elevation range: {np.nanmin(self.dem_data):.1f} to {np.nanmax(self.dem_data):.1f}")
     
@@ -336,15 +376,66 @@ class InteractiveMeshViewer:
         # Render high-resolution image
         self._render_high_res(camera_info)
     
-    def _render_high_res(self, camera_info: dict, max_dimension: int = 8192):
+    def _render_high_res(self, camera_info: dict, max_dimension: int = 4096, 
+                         max_mesh_dimension: int = 4000):
         """
         Render the current view at high resolution and save to file.
         
+        Temporarily loads a higher-resolution version of the DEM for rendering,
+        then restores the downsampled version for interactive viewing.
+        
         Args:
             camera_info: Dictionary containing camera settings
-            max_dimension: Maximum dimension (width or height) for output
+            max_dimension: Maximum dimension (width or height) for output image
+            max_mesh_dimension: Maximum dimension for the mesh used in rendering.
+                               Higher = better quality but more memory. Default: 4000
         """
         print("\nRendering high-resolution image...")
+        
+        # Save current (downsampled) DEM data
+        original_dem_data = self.dem_data
+        original_transform = self.transform
+        
+        # Reload DEM at higher resolution for rendering
+        print(f"Loading high-resolution DEM for rendering (max {max_mesh_dimension}px)...")
+        with rasterio.open(self.dem_path) as src:
+            full_dem = src.read(1).astype(np.float32)
+            full_transform = src.transform
+        
+        # Downsample if still too large, but at higher resolution than interactive
+        current_max = max(full_dem.shape)
+        if current_max > max_mesh_dimension:
+            from scipy.ndimage import zoom
+            from affine import Affine
+            
+            scale_factor = max_mesh_dimension / current_max
+            new_height = int(full_dem.shape[0] * scale_factor)
+            new_width = int(full_dem.shape[1] * scale_factor)
+            
+            print(f"  Downsampling for render: {full_dem.shape[1]}x{full_dem.shape[0]} -> {new_width}x{new_height}")
+            
+            # Handle nodata before downsampling
+            nodata_mask = (full_dem == -9999) | np.isnan(full_dem)
+            full_dem[nodata_mask] = np.nan
+            full_dem = zoom(full_dem, scale_factor, order=1, mode='nearest')
+            
+            full_transform = Affine(
+                full_transform.a / scale_factor,
+                full_transform.b,
+                full_transform.c,
+                full_transform.d,
+                full_transform.e / scale_factor,
+                full_transform.f
+            )
+        
+        # Handle nodata values
+        full_dem = np.nan_to_num(full_dem, nan=0.0)
+        
+        # Temporarily use high-res DEM
+        self.dem_data = full_dem
+        self.transform = full_transform
+        
+        print(f"  Render mesh shape: {self.dem_data.shape}")
         
         # Get current window aspect ratio to match the interactive view
         current_window_size = self.plotter.window_size
@@ -449,6 +540,11 @@ class InteractiveMeshViewer:
         print(f"High-resolution image saved to: {output_path.absolute()}")
         print(f"  Resolution: {resolution[0]}x{resolution[1]}")
         print(f"  Mesh pixel range: [{self.params['pixel_min']}, {self.params['pixel_max']}]")
+        
+        # Restore the original downsampled DEM for interactive viewing
+        self.dem_data = original_dem_data
+        self.transform = original_transform
+        print("Restored interactive-resolution DEM.")
     
     def _remap_pixel_values(self, img: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -826,10 +922,18 @@ Example:
         polygon_coords = load_radius_from_geojson(polygon_coords)
     print(f"Loaded polygon with {len(polygon_coords)} vertices")
     
-    # Check if DEM exists, if not extract it
+    # Check if DEM exists, if not extract it using mosaic approach
     if not dem_file.exists():
-        print(f"\nDEM not found. Extracting DEM data...")
-        result, _ = extract_dem_from_geojson(geojson_data, str(dem_file), polygon_coords)
+        print(f"\nDEM not found. Extracting DEM data with mosaic approach...")
+        # Use mosaic extraction to get highest available resolution (1m > 3m > 10m)
+        # max_dimension=4000 ensures the final DEM is manageable for interactive viewing
+        result, _ = extract_dem_mosaic_from_geojson(
+            geojson_data, 
+            str(dem_file), 
+            polygon_coords,
+            resolutions=[1, 3, 10],  # Prioritize highest resolution
+            max_dimension=4000  # Limit to 4000px on longest side for interactive use
+        )
         if result is None:
             print("Error: Failed to extract DEM data.")
             return 1
