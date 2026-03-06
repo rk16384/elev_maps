@@ -1,0 +1,48 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/tetons/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.284350030242301,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 17.50571960386756,
+    "light_azimuth": 178.76429889743522,
+    "light_distance": 100000.0,
+    "z_rotation": 0.0,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      12913.586636844922,
+      1380.5938407260285,
+      3200.035883788597
+    ],
+    "focal_point": [
+      2963.930534229744,
+      3974.3409102256783,
+      3561.4712942657316
+    ],
+    "view_up": [
+      0.02002151804596131,
+      -0.062247658239397756,
+      0.9978598939023686
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      21.695346850703835,
+      21695.346850703834
+    ],
+    "parallel_scale": 5647.923237402503,
+    "parallel_projection": false
+  },
+  "window_size": [
+    2300,
+    1024
+  ],
+  "timestamp": "2026-02-05T22:40:09.510782",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

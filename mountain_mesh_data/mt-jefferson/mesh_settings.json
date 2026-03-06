@@ -1,0 +1,48 @@
+{
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  },
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/mt-jefferson/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.7254362793375821,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 30.13141201805651,
+    "light_azimuth": 336.92820886665385,
+    "light_distance": 100000.0,
+    "z_rotation": 57.244828994513384,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      -14599.147173113155,
+      -4222.6362774284335,
+      8388.559104692738
+    ],
+    "focal_point": [
+      8725.972375748208,
+      8981.838160191784,
+      1808.6603724881875
+    ],
+    "view_up": [
+      0.20966769450594883,
+      0.11356591445435747,
+      0.971155106537934
+    ],
+    "view_angle": 27.279082058888715,
+    "clipping_range": [
+      2602.1041433654977,
+      58601.87106260422
+    ],
+    "parallel_scale": 12790.405115909647,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1852,
+    1074
+  ],
+  "timestamp": "2026-02-20T22:10:36.251838"
+}

@@ -1,0 +1,48 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/brighton/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.9922675921387303,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 37.73117110983114,
+    "light_azimuth": 99.44708621901987,
+    "light_distance": 100000.0,
+    "z_rotation": 0.0,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      769.1365651719991,
+      6293.22059749175,
+      6704.38758910513
+    ],
+    "focal_point": [
+      2455.1072987090206,
+      -1251.207424384426,
+      4871.47808061058
+    ],
+    "view_up": [
+      0.09836850776421453,
+      -0.21412484551410688,
+      0.9718406182156628
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      1080.4179342727118,
+      9900.760864513099
+    ],
+    "parallel_scale": 2435.2589136543893,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1984,
+    1160
+  ],
+  "timestamp": "2026-02-03T20:41:11.015013",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

@@ -3,9 +3,10 @@ Interactive 3D DEM mesh viewer with adjustable lighting and camera controls.
 
 Usage:
     python interactive_mesh.py <location_name>
+    python interactive_mesh.py <location_name> --auto-accept
     
-    First, create a folder: mountain_mesh_data/<location_name>/
-    Then paste your GeoJSON polygon into: mountain_mesh_data/<location_name>/polygon.json
+    First, create a folder: /Volumes/sandisk1/data_cache/mountain_mesh_data/<location_name>/
+    Then paste your GeoJSON polygon into: /Volumes/sandisk1/data_cache/mountain_mesh_data/<location_name>/polygon.json
     
 Controls:
     - Use mouse to rotate/pan/zoom the view
@@ -31,7 +32,7 @@ from extract_dem_data import extract_dem_from_geojson, extract_dem_mosaic_from_g
 
 
 # Base directory for all location data
-BASE_DIR = Path(__file__).parent / "mountain_mesh_data"
+BASE_DIR = Path("/Volumes/sandisk1/data_cache/mountain_mesh_data")
 
 
 class InteractiveMeshViewer:
@@ -50,6 +51,10 @@ class InteractiveMeshViewer:
         self.plotter = None
         self.light = None
         self.actor = None
+        self.save_requested = False
+        self._pending_camera_info = None
+        self._pending_window_size = None
+        self.export_stl = False
         
         # Default parameters
         self.params = {
@@ -325,9 +330,8 @@ class InteractiveMeshViewer:
         self.params["z_rotation"] = value
         self._update_mesh()
     
-    def _save_settings(self):
-        """Save current settings and camera position to file and print to terminal."""
-        # Get camera information
+    def _capture_current_view_state(self):
+        """Capture current camera/window state while the interactive plotter is valid."""
         camera = self.plotter.camera
         camera_info = {
             "position": list(camera.position),
@@ -338,18 +342,38 @@ class InteractiveMeshViewer:
             "parallel_scale": camera.parallel_scale,
             "parallel_projection": camera.parallel_projection,
         }
-        
-        # Get current window size
         window_size = list(self.plotter.window_size)
+        return camera_info, window_size
+
+    def _save_settings(self, camera_info: dict | None = None, window_size: list | None = None):
+        """Save current settings and camera position to file and print to terminal."""
+        if camera_info is None or window_size is None:
+            camera_info, window_size = self._capture_current_view_state()
         
-        # Full settings dict
-        settings = {
+        # Build core settings payload written by this tool.
+        core_settings = {
             "dem_path": str(self.dem_path),
             "parameters": self.params.copy(),
             "camera": camera_info,
             "window_size": window_size,
             "timestamp": datetime.now().isoformat(),
         }
+
+        # Preserve unrelated top-level settings blocks (e.g. title settings).
+        preserved = {}
+        if self.settings_file.exists():
+            try:
+                with open(self.settings_file, "r") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    for key, value in existing.items():
+                        if key not in core_settings:
+                            preserved[key] = value
+            except Exception:
+                # If existing settings are invalid, fall back to writing core settings only.
+                preserved = {}
+
+        settings = {**preserved, **core_settings}
         
         # Print to terminal
         print("\n" + "=" * 60)
@@ -374,10 +398,20 @@ class InteractiveMeshViewer:
         print(f"Settings saved to: {self.settings_file.absolute()}")
         
         # Render high-resolution image
-        self._render_high_res(camera_info)
+        self._render_high_res(
+            camera_info,
+            window_size=window_size,
+            export_stl=self.export_stl,
+        )
     
-    def _render_high_res(self, camera_info: dict, max_dimension: int = 4096, 
-                         max_mesh_dimension: int = 4000):
+    def _render_high_res(
+        self,
+        camera_info: dict,
+        window_size: list | tuple | None = None,
+        max_dimension: int = 4096,
+        max_mesh_dimension: int = 4000,
+        export_stl: bool = False,
+    ):
         """
         Render the current view at high resolution and save to file.
         
@@ -386,6 +420,8 @@ class InteractiveMeshViewer:
         
         Args:
             camera_info: Dictionary containing camera settings
+            window_size: Optional [width, height] to preserve interactive aspect ratio.
+                         If not provided, falls back to saved/default size.
             max_dimension: Maximum dimension (width or height) for output image
             max_mesh_dimension: Maximum dimension for the mesh used in rendering.
                                Higher = better quality but more memory. Default: 4000
@@ -437,8 +473,34 @@ class InteractiveMeshViewer:
         
         print(f"  Render mesh shape: {self.dem_data.shape}")
         
-        # Get current window aspect ratio to match the interactive view
-        current_window_size = self.plotter.window_size
+        # Determine output aspect ratio without relying on a potentially closed plotter.
+        if (
+            window_size is not None
+            and len(window_size) == 2
+            and window_size[0] > 0
+            and window_size[1] > 0
+        ):
+            current_window_size = [int(window_size[0]), int(window_size[1])]
+            window_source = "captured interactive window size"
+        elif (
+            self.saved_window_size is not None
+            and len(self.saved_window_size) == 2
+            and self.saved_window_size[0] > 0
+            and self.saved_window_size[1] > 0
+        ):
+            current_window_size = [
+                int(self.saved_window_size[0]),
+                int(self.saved_window_size[1]),
+            ]
+            window_source = "saved window size"
+        else:
+            current_window_size = [1920, 1080]
+            window_source = "default fallback"
+
+        print(
+            f"  Using aspect ratio source: {window_source} "
+            f"({current_window_size[0]}x{current_window_size[1]})"
+        )
         aspect_ratio = current_window_size[0] / current_window_size[1]
         
         # Calculate output resolution maintaining aspect ratio
@@ -458,6 +520,14 @@ class InteractiveMeshViewer:
         mesh = mesh.rotate_z(self.params["z_rotation"], point=mesh.center, inplace=False)
         self.mesh = mesh  # so _calculate_light_position uses mesh center
         light_pos = self._calculate_light_position()
+
+        if export_stl:
+            # Convert to a clean triangular surface mesh for broad CAD compatibility.
+            stl_surface = mesh.extract_surface().triangulate()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stl_path = self.location_dir / f"terrain_mesh_{timestamp}.stl"
+            stl_surface.save(str(stl_path))
+            print(f"STL mesh exported to: {stl_path.absolute()}")
         
         def create_plotter(background_color):
             """Helper to create a configured plotter with given background."""
@@ -665,16 +735,25 @@ class InteractiveMeshViewer:
         return centered
         
     def _on_key_press(self):
-        """Handle key press events."""
-        self._save_settings()
+        """Handle key press events without rendering inside the live VTK event loop."""
+        self.save_requested = True
+        self._pending_camera_info, self._pending_window_size = self._capture_current_view_state()
+        print("Save/render queued. Press 'q' to close viewer and run export.")
     
-    def run(self):
-        """Launch the interactive viewer."""
+    def run(self, auto_accept: bool = False, export_stl: bool = False):
+        """Launch the interactive viewer or run a non-interactive save/render pass."""
+        self.export_stl = export_stl
+
         # Create plotter with saved window size if available
+        off_screen = auto_accept
         if self.saved_window_size is not None:
-            self.plotter = pv.Plotter(lighting="none", window_size=self.saved_window_size)
+            self.plotter = pv.Plotter(
+                lighting="none",
+                window_size=self.saved_window_size,
+                off_screen=off_screen,
+            )
         else:
-            self.plotter = pv.Plotter(lighting="none")
+            self.plotter = pv.Plotter(lighting="none", off_screen=off_screen)
         self.plotter.set_background("white")
         
         # Create initial mesh and apply Z rotation
@@ -711,79 +790,6 @@ class InteractiveMeshViewer:
         )
         self.plotter.add_light(ambient_light)
         
-        # Add sliders (left column)
-        slider_y_positions = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
-        
-        self.plotter.add_slider_widget(
-            self._on_vertical_exaggeration,
-            rng=[0.5, 10.0],
-            value=self.params["vertical_exaggeration"],
-            title="Vertical Exaggeration",
-            pointa=(0.02, slider_y_positions[0]),
-            pointb=(0.25, slider_y_positions[0]),
-            style="modern",
-        )
-        
-        self.plotter.add_slider_widget(
-            self._on_smoothing,
-            rng=[0.0, 10.0],
-            value=self.params["smoothing_sigma"],
-            title="Smoothing Sigma",
-            pointa=(0.02, slider_y_positions[1]),
-            pointb=(0.25, slider_y_positions[1]),
-            style="modern",
-        )
-        
-        self.plotter.add_slider_widget(
-            self._on_light_elevation,
-            rng=[0.0, 90.0],
-            value=self.params["light_elevation"],
-            title="Light Elevation",
-            pointa=(0.02, slider_y_positions[2]),
-            pointb=(0.25, slider_y_positions[2]),
-            style="modern",
-        )
-        
-        self.plotter.add_slider_widget(
-            self._on_light_azimuth,
-            rng=[0.0, 360.0],
-            value=self.params["light_azimuth"],
-            title="Light Azimuth",
-            pointa=(0.02, slider_y_positions[3]),
-            pointb=(0.25, slider_y_positions[3]),
-            style="modern",
-        )
-        
-        self.plotter.add_slider_widget(
-            self._on_light_distance,
-            rng=[100.0, 100000.0],
-            value=self.params["light_distance"],
-            title="Light Distance",
-            pointa=(0.02, slider_y_positions[4]),
-            pointb=(0.25, slider_y_positions[4]),
-            style="modern",
-        )
-        
-        self.plotter.add_slider_widget(
-            self._on_z_rotation,
-            rng=[0.0, 360.0],
-            value=self.params["z_rotation"],
-            title="Z Rotation",
-            pointa=(0.02, slider_y_positions[5]),
-            pointb=(0.25, slider_y_positions[5]),
-            style="modern",
-        )
-        
-        # Add key binding for saving settings
-        self.plotter.add_key_event("p", self._on_key_press)
-        
-        # Add text instructions
-        self.plotter.add_text(
-            "Press 'p' to save settings + render | 'q' to quit",
-            position="lower_right",
-            font_size=10,
-        )
-        
         # Set camera view
         if self.saved_camera is not None:
             # Restore saved camera position
@@ -800,15 +806,100 @@ class InteractiveMeshViewer:
             # Default: looking down at terrain
             self.plotter.camera_position = "xy"
             self.plotter.reset_camera()
-        
+
+        if auto_accept:
+            print("\nAuto-accept enabled: saving settings + rendering high-res image...\n")
+            self._save_settings()
+            self.plotter.close()
+            return
+
+        # Add sliders (left column)
+        slider_y_positions = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
+
+        self.plotter.add_slider_widget(
+            self._on_vertical_exaggeration,
+            rng=[0.5, 10.0],
+            value=self.params["vertical_exaggeration"],
+            title="Vertical Exaggeration",
+            pointa=(0.02, slider_y_positions[0]),
+            pointb=(0.25, slider_y_positions[0]),
+            style="modern",
+        )
+
+        self.plotter.add_slider_widget(
+            self._on_smoothing,
+            rng=[0.0, 10.0],
+            value=self.params["smoothing_sigma"],
+            title="Smoothing Sigma",
+            pointa=(0.02, slider_y_positions[1]),
+            pointb=(0.25, slider_y_positions[1]),
+            style="modern",
+        )
+
+        self.plotter.add_slider_widget(
+            self._on_light_elevation,
+            rng=[0.0, 90.0],
+            value=self.params["light_elevation"],
+            title="Light Elevation",
+            pointa=(0.02, slider_y_positions[2]),
+            pointb=(0.25, slider_y_positions[2]),
+            style="modern",
+        )
+
+        self.plotter.add_slider_widget(
+            self._on_light_azimuth,
+            rng=[0.0, 360.0],
+            value=self.params["light_azimuth"],
+            title="Light Azimuth",
+            pointa=(0.02, slider_y_positions[3]),
+            pointb=(0.25, slider_y_positions[3]),
+            style="modern",
+        )
+
+        self.plotter.add_slider_widget(
+            self._on_light_distance,
+            rng=[100.0, 100000.0],
+            value=self.params["light_distance"],
+            title="Light Distance",
+            pointa=(0.02, slider_y_positions[4]),
+            pointb=(0.25, slider_y_positions[4]),
+            style="modern",
+        )
+
+        self.plotter.add_slider_widget(
+            self._on_z_rotation,
+            rng=[0.0, 360.0],
+            value=self.params["z_rotation"],
+            title="Z Rotation",
+            pointa=(0.02, slider_y_positions[5]),
+            pointb=(0.25, slider_y_positions[5]),
+            style="modern",
+        )
+
+        # Add key binding for saving settings
+        self.plotter.add_key_event("p", self._on_key_press)
+
+        # Add text instructions
+        self.plotter.add_text(
+            "Press 'p' to queue save+render, then 'q' to quit",
+            position="lower_right",
+            font_size=10,
+        )
+
         # Show
         print("\nStarting interactive viewer...")
         print("  - Use mouse to rotate/pan/zoom")
         print("  - Adjust sliders to modify parameters")
-        print("  - Press 'p' to save settings and render high-res image")
+        print("  - Press 'p' to queue save+render")
+        print("  - Press 'q' to close viewer and run queued render")
         print("  - Press 'q' to quit\n")
-        
+
         self.plotter.show()
+        if self.save_requested:
+            self._save_settings(
+                camera_info=self._pending_camera_info,
+                window_size=self._pending_window_size,
+            )
 
 
 def load_polygon_from_geojson(geojson_path: Path) -> list:
@@ -873,22 +964,32 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-    1. Create folder: mountain_mesh_data/my_mountain/
-    2. Paste GeoJSON polygon into: mountain_mesh_data/my_mountain/polygon.json
+    1. Create folder: /Volumes/sandisk1/data_cache/mountain_mesh_data/my_mountain/
+    2. Paste GeoJSON polygon into: /Volumes/sandisk1/data_cache/mountain_mesh_data/my_mountain/polygon.json
     3. Run: python interactive_mesh.py my_mountain
         """
     )
     parser.add_argument(
         "location_name",
         nargs="?",
-        default="tetons",
-        help="Name of the location folder inside mountain_mesh_data/ (default: brighton)",
+        default="mt-rainier",
+        help="Name of the location folder inside /Volumes/sandisk1/data_cache/mountain_mesh_data/ (default: brighton)",
     )
     parser.add_argument(
         "method",
         nargs="?",
-        default="polygon",
+        default="radius",
         help="Method of defining the area: polygon, radius"
+    )
+    parser.add_argument(
+        "--auto-accept",
+        action="store_true",
+        help="Run non-interactively and immediately save settings + render output.",
+    )
+    parser.add_argument(
+        "--export-stl",
+        action="store_true",
+        help="Also export the generated terrain mesh as STL during save/render.",
     )
     args = parser.parse_args()
     
@@ -942,7 +1043,7 @@ Example:
     
     # Launch viewer
     viewer = InteractiveMeshViewer(location_dir, polygon_coords)
-    viewer.run()
+    viewer.run(auto_accept=args.auto_accept, export_stl=args.export_stl)
     return 0
 
 

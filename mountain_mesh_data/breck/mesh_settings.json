@@ -1,0 +1,41 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/breck/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 0.5,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 33.814564673705526,
+    "light_azimuth": 143.26084508140138,
+    "light_distance": 19050.8279483736
+  },
+  "camera": {
+    "position": [
+      1650.5694268034536,
+      1229.0597306226937,
+      1571.9675192657533
+    ],
+    "focal_point": [
+      161.9038922261114,
+      253.53016613206398,
+      1687.6102689296238
+    ],
+    "view_up": [
+      0.0064514253707726645,
+      0.10800274734852755,
+      0.9941296624061952
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      246.2088301023849,
+      3021.758058067595
+    ],
+    "parallel_scale": 679.3771624165954,
+    "parallel_projection": false
+  },
+  "timestamp": "2025-12-14T10:05:28.760343",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

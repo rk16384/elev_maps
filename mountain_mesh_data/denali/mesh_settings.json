@@ -1,0 +1,48 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/../mountain_mesh_data/mt-sthelens/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.7254362793375821,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 30.13141201805651,
+    "light_azimuth": 336.92820886665385,
+    "light_distance": 100000.0,
+    "z_rotation": 92.02545967375478,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      -14748.142793431662,
+      -3911.356559100391,
+      8388.159163227
+    ],
+    "focal_point": [
+      8474.226621136926,
+      9299.719001474212,
+      1466.9269192833578
+    ],
+    "view_up": [
+      0.2230816175368185,
+      0.11499600103913997,
+      0.9679930328582756
+    ],
+    "view_angle": 27.279082058888715,
+    "clipping_range": [
+      2925.630891632482,
+      58577.44046578087
+    ],
+    "parallel_scale": 12746.6575039864,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1852,
+    1074
+  ],
+  "timestamp": "2026-01-31T20:39:23.381002",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

@@ -7,8 +7,9 @@ user save the composite at full resolution.
 
 Usage:
     python drop_shadow_editor.py <name>
+    python drop_shadow_editor.py <name> --auto-accept
 
-    Where <name> is a folder within mountain_mesh_data/ (e.g., mt-baker).
+    Where <name> is a folder within /Volumes/sandisk1/data_cache/mountain_mesh_data/ (e.g., mt-baker).
     The script will find and use the most recent mesh_render_*.png in that folder.
 
 Controls:
@@ -19,6 +20,7 @@ Controls:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 from PIL import Image, ImageFilter
@@ -27,6 +29,13 @@ from PIL import Image, ImageFilter
 OBJECT_LUMINANCE_THRESHOLD = 255
 # Light gray for shadow (RGB)
 SHADOW_COLOR = (200, 200, 200)
+DEFAULT_SHADOW_SETTINGS = {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 50,
+    "shadow_gray": 159,
+}
+BASE_DIR = Path("/Volumes/sandisk1/data_cache/mountain_mesh_data")
 
 
 def load_image(path: Path) -> Image.Image:
@@ -174,7 +183,54 @@ def composite_with_shadow(
     return result
 
 
-def run_editor(image_path: Path) -> None:
+def load_mesh_settings(settings_path: Path) -> dict:
+    """Load mesh settings JSON if present, otherwise return empty dict."""
+    if not settings_path.exists():
+        return {}
+    try:
+        with open(settings_path, "r") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def parse_shadow_settings(mesh_settings: dict) -> dict:
+    """Return validated shadow settings from mesh settings with defaults."""
+    settings = DEFAULT_SHADOW_SETTINGS.copy()
+    raw = mesh_settings.get("shadow_settings")
+    if not isinstance(raw, dict):
+        return settings
+
+    if isinstance(raw.get("offset_x"), (int, float)):
+        settings["offset_x"] = int(raw["offset_x"])
+    if isinstance(raw.get("offset_y"), (int, float)):
+        settings["offset_y"] = int(raw["offset_y"])
+    if isinstance(raw.get("blur_radius"), (int, float)):
+        settings["blur_radius"] = float(raw["blur_radius"])
+    if isinstance(raw.get("shadow_gray"), (int, float)):
+        settings["shadow_gray"] = int(raw["shadow_gray"])
+
+    settings["shadow_gray"] = max(0, min(255, settings["shadow_gray"]))
+    return settings
+
+
+def save_shadow_settings(settings_path: Path, state: dict) -> None:
+    """Persist shadow settings into mesh_settings.json without losing other keys."""
+    mesh_settings = load_mesh_settings(settings_path)
+    mesh_settings["shadow_settings"] = {
+        "offset_x": int(state["offset_x"]),
+        "offset_y": int(state["offset_y"]),
+        "blur_radius": float(state["blur_radius"]),
+        "shadow_gray": int(state["shadow_gray"]),
+    }
+    with open(settings_path, "w") as handle:
+        json.dump(mesh_settings, handle, indent=2)
+
+
+def run_editor(image_path: Path, settings_path: Path) -> None:
     """Run the tkinter GUI for adjusting and saving the drop shadow."""
     import tkinter as tk
     from tkinter import ttk
@@ -190,12 +246,13 @@ def run_editor(image_path: Path) -> None:
     preview_size = (int(w * scale), int(h * scale))
     ARROW_STEP = 3
     SLIDER_OFFSET_RANGE = 500
+    shadow_settings = parse_shadow_settings(load_mesh_settings(settings_path))
 
     state = {
-        "offset_x": int(SLIDER_OFFSET_RANGE * 0.85),
-        "offset_y": int(SLIDER_OFFSET_RANGE * 0.85),
-        "blur_radius": 85.0,
-        "shadow_gray": 160,
+        "offset_x": max(-SLIDER_OFFSET_RANGE, min(SLIDER_OFFSET_RANGE, int(shadow_settings["offset_x"]))),
+        "offset_y": max(-SLIDER_OFFSET_RANGE, min(SLIDER_OFFSET_RANGE, int(shadow_settings["offset_y"]))),
+        "blur_radius": float(shadow_settings["blur_radius"]),
+        "shadow_gray": int(shadow_settings["shadow_gray"]),
         "original": original,
         "shadow_mask": shadow_mask,
         "image_mask": image_mask,
@@ -271,6 +328,7 @@ def run_editor(image_path: Path) -> None:
         stem = image_path.stem
         out_path = image_path.parent / f"shadow_{stem}.png"
         out.save(out_path)
+        save_shadow_settings(settings_path, state)
         status_var.set(f"Saved: {out_path.name}")
         root.after(3000, lambda: status_var.set("Press 's' or Enter to save | Arrow keys move shadow"))
 
@@ -351,6 +409,27 @@ def run_editor(image_path: Path) -> None:
     root.mainloop()
 
 
+def run_auto_accept(image_path: Path, settings_path: Path) -> None:
+    """Save a shadow image using persisted settings (or defaults if missing)."""
+    shadow_settings = parse_shadow_settings(load_mesh_settings(settings_path))
+    offset_x = int(shadow_settings["offset_x"])
+    offset_y = int(shadow_settings["offset_y"])
+    blur_radius = float(shadow_settings["blur_radius"])
+    shadow_gray = int(shadow_settings["shadow_gray"])
+
+    original = load_image(image_path)
+    out = composite_with_shadow(
+        original,
+        offset_x,
+        offset_y,
+        blur_radius,
+        shadow_gray,
+    )
+    out_path = image_path.parent / f"shadow_{image_path.stem}.png"
+    out.save(out_path)
+    print(f"Saved: {out_path.name}")
+
+
 def find_most_recent_mesh_render(folder: Path) -> Path | None:
     """Find the most recent mesh_render_*.png in the given folder."""
     renders = list(folder.glob("mesh_render_*.png"))
@@ -369,13 +448,18 @@ def main() -> int:
         "name",
         nargs="?",
         default="tetons",
-        help="Folder name within mountain_mesh_data/ (e.g., mt-baker)",
+        help="Folder name within /Volumes/sandisk1/data_cache/mountain_mesh_data/ (e.g., mt-baker)",
+    )
+    parser.add_argument(
+        "--auto-accept",
+        action="store_true",
+        help="Run non-interactively and save output using persisted shadow settings.",
     )
     args = parser.parse_args()
     
     # Build path to the mountain_mesh_data folder
-    script_dir = Path(__file__).resolve().parent
-    mesh_folder = script_dir / "mountain_mesh_data" / args.name
+    mesh_folder = BASE_DIR / args.name
+    settings_path = mesh_folder / "mesh_settings.json"
     
     if not mesh_folder.exists():
         print(f"Error: folder not found: {mesh_folder}")
@@ -388,7 +472,10 @@ def main() -> int:
         return 1
     
     print(f"Using: {path.name}")
-    run_editor(path)
+    if args.auto_accept:
+        run_auto_accept(path, settings_path)
+    else:
+        run_editor(path, settings_path)
     return 0
 
 

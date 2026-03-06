@@ -1,0 +1,41 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/solitude/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 0.9813189762155312,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 23.028587242145594,
+    "light_azimuth": 107.39880959502027,
+    "light_distance": 10000.0
+  },
+  "camera": {
+    "position": [
+      1087.7742377811644,
+      2511.3241674779456,
+      2667.9609579450193
+    ],
+    "focal_point": [
+      509.89452611680497,
+      304.0023942411364,
+      2577.657924582356
+    ],
+    "view_up": [
+      -0.036343969563541974,
+      -0.03134863235757752,
+      0.9988475254640589
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      421.15862251941115,
+      3889.5208350255607
+    ],
+    "parallel_scale": 928.8905191896208,
+    "parallel_projection": false
+  },
+  "timestamp": "2025-12-11T23:09:31.389021",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

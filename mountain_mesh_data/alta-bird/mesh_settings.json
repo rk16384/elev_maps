@@ -1,0 +1,48 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/alta-bird/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.5923206117859507,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 45.0,
+    "light_azimuth": 94.70655313638255,
+    "light_distance": 100000.0,
+    "z_rotation": 0.0,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      1835.824057505144,
+      11887.554697242915,
+      8732.739490442225
+    ],
+    "focal_point": [
+      4487.045054852724,
+      3027.880247342007,
+      4175.708500879962
+    ],
+    "view_up": [
+      0.03790371441274111,
+      -0.4480762797420085,
+      0.8931914441855557
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      692.1341186252622,
+      21278.14763018343
+    ],
+    "parallel_scale": 5719.822581242161,
+    "parallel_projection": false
+  },
+  "window_size": [
+    2704,
+    1384
+  ],
+  "timestamp": "2026-02-03T20:54:51.280812",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

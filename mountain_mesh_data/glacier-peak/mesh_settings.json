@@ -1,0 +1,48 @@
+{
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  },
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/glacier-peak/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.7254362793375821,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 30.13141201805651,
+    "light_azimuth": 345.719471687045,
+    "light_distance": 100000.0,
+    "z_rotation": 171.816318290838,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      -14881.942752384282,
+      -3741.603002416068,
+      8638.984065236888
+    ],
+    "focal_point": [
+      8730.22044262962,
+      9676.389273348776,
+      3725.976126300417
+    ],
+    "view_up": [
+      0.15713568421428797,
+      0.08378073007312206,
+      0.9840168525055464
+    ],
+    "view_angle": 27.279082058888715,
+    "clipping_range": [
+      2108.071838387822,
+      58984.207753256436
+    ],
+    "parallel_scale": 12796.295338418,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1852,
+    1074
+  ],
+  "timestamp": "2026-02-20T21:40:27.335290"
+}

@@ -19,6 +19,7 @@ import rasterio
 import requests
 import rioxarray
 import xarray
+from rasterio.errors import RasterioIOError
 from rasterio.merge import merge as rio_merge
 from shapely.geometry import box, shape
 
@@ -273,11 +274,51 @@ def extract_dem_mosaic(polygon, output_path: str, resolutions: list = None,
         cache_dir.mkdir(exist_ok=True)
     
     processed_tiles = []
+    max_tile_pixels = 16_000_000
+    max_fetch_retries = 3
+    retryable_status_codes = {429, 500, 502, 503, 504}
+    non_retryable_status_codes = {400, 401, 403, 404, 422}
+    deg_to_m = 111320  # Approximate conversion at mid-latitudes
     
     def _get_tile_cache_path(tile_bounds, resolution):
         """Generate cache path for a tile."""
         bbox_str = f"{tile_bounds[0]:.6f}_{tile_bounds[1]:.6f}_{tile_bounds[2]:.6f}_{tile_bounds[3]:.6f}"
         return cache_dir / f"tile_{bbox_str}_{resolution}m.tif"
+
+    def _estimate_pixel_count(tile_bounds, resolution):
+        """Estimate request pixel count for a tile at a given resolution."""
+        width = max(1, int((tile_bounds[2] - tile_bounds[0]) * deg_to_m / resolution))
+        height = max(1, int((tile_bounds[3] - tile_bounds[1]) * deg_to_m / resolution))
+        return width, height, width * height
+
+    def _is_decode_error(exc):
+        """Detect raster decode/open errors for in-memory TIFF responses."""
+        msg = str(exc).lower()
+        return (
+            isinstance(exc, RasterioIOError)
+            or "not recognized as being in a supported file format" in msg
+            or ("/vsimem/" in msg and "supported file format" in msg)
+        )
+
+    def _classify_fetch_error(exc):
+        """Classify errors as retryable or non-retryable for mosaic flow."""
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+
+        if status_code in non_retryable_status_codes:
+            return "non_retryable", status_code
+        if status_code in retryable_status_codes:
+            return "retryable", status_code
+
+        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return "retryable", status_code
+        if isinstance(exc, requests.exceptions.RequestException):
+            return "retryable", status_code
+        if _is_decode_error(exc):
+            return "retryable", status_code
+        if isinstance(exc, ValueError) and "server did not return an image" in str(exc).lower():
+            return "retryable", status_code
+
+        return "non_retryable", status_code
     
     def _process_tile(tile_geom, tile_id, depth=0):
         """
@@ -294,71 +335,103 @@ def extract_dem_mosaic(polygon, output_path: str, resolutions: list = None,
         print(f"{indent}Tile {tile_id}: {tile_width:.4f}° x {tile_height:.4f}°")
         
         for resolution in resolutions:
-            try:
-                # Check cache first
-                cache_path = _get_tile_cache_path(tile_bounds, resolution)
-                if use_cache and cache_path.exists():
-                    print(f"{indent}  Loading cached tile at {resolution}m...")
-                    with rioxarray.open_rasterio(cache_path) as rds:
-                        dem_data = rds.squeeze(drop=True).copy()
-                    print(f"{indent}  Loaded from cache: {dem_data.shape}")
-                    return [dem_data]
-                
-                print(f"{indent}  Trying {resolution}m resolution...")
-                dem_data = fetch_dem_from_3dep(tile_bounds, resolution)
-                
-                # Validate the data
-                data_values = dem_data.values
-                nodata_val = dem_data.rio.nodata or -9999
-                
-                # Check for nodata/invalid pixels
-                valid_mask = ~np.isnan(data_values) & ~np.isclose(data_values, nodata_val)
-                valid_ratio = np.count_nonzero(valid_mask) / data_values.size
-                
-                if valid_ratio < 0.90:  # Less than 90% valid data
-                    raise ValueError(f"Tile has only {valid_ratio*100:.1f}% valid data")
-                
-                # Check for flat/empty tiles
-                valid_data = data_values[valid_mask]
-                if len(valid_data) > 0 and (np.max(valid_data) - np.min(valid_data)) < 1:
-                    raise ValueError("Tile appears flat/empty")
-                
-                # Success! Save to cache and return
-                if use_cache:
-                    dem_data.rio.to_raster(str(cache_path))
-                
-                print(f"{indent}  Success at {resolution}m! Shape: {dem_data.shape}")
+            # Check cache first
+            cache_path = _get_tile_cache_path(tile_bounds, resolution)
+            if use_cache and cache_path.exists():
+                print(f"{indent}  Loading cached tile at {resolution}m...")
+                with rioxarray.open_rasterio(cache_path) as rds:
+                    dem_data = rds.squeeze(drop=True).copy()
+                print(f"{indent}  Loaded from cache: {dem_data.shape}")
                 return [dem_data]
-                
-            except (requests.exceptions.HTTPError, requests.exceptions.RequestException) as e:
-                error_code = getattr(getattr(e, 'response', None), 'status_code', None)
-                
-                # Subdivide on server errors (500, 502, 504) or timeouts if not at min size
-                should_subdivide = (
-                    not is_min_size and 
-                    (error_code in (500, 502, 504) or 
-                     isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)))
+
+            req_width, req_height, pixel_count = _estimate_pixel_count(tile_bounds, resolution)
+            if pixel_count > max_tile_pixels:
+                if not is_min_size:
+                    print(
+                        f"{indent}  {resolution}m request too large "
+                        f"({req_width}x{req_height}={pixel_count:,} px), subdividing before request..."
+                    )
+                    return _subdivide_tile(tile_geom, tile_id, depth)
+                print(
+                    f"{indent}  {resolution}m request too large "
+                    f"({req_width}x{req_height}={pixel_count:,} px) at minimum tile size, trying next resolution."
                 )
-                
-                if should_subdivide:
-                    print(f"{indent}  Failed at {resolution}m (error: {error_code or type(e).__name__}), subdividing...")
-                    return _subdivide_tile(tile_geom, tile_id, depth)
-                else:
-                    print(f"{indent}  Failed at {resolution}m: {type(e).__name__}")
-                    continue
-                    
-            except ValueError as e:
-                # Validation errors - try next resolution or subdivide
-                if not is_min_size and "valid data" in str(e):
-                    print(f"{indent}  {e}, subdividing...")
-                    return _subdivide_tile(tile_geom, tile_id, depth)
-                else:
-                    print(f"{indent}  {e}")
-                    continue
-                    
-            except Exception as e:
-                print(f"{indent}  Unexpected error: {e}")
                 continue
+
+            print(f"{indent}  Trying {resolution}m resolution...")
+
+            for attempt in range(1, max_fetch_retries + 1):
+                try:
+                    dem_data = fetch_dem_from_3dep(tile_bounds, resolution, max_retries=1)
+
+                    # Validate the data
+                    data_values = dem_data.values
+                    nodata_val = dem_data.rio.nodata or -9999
+
+                    # Check for nodata/invalid pixels
+                    valid_mask = ~np.isnan(data_values) & ~np.isclose(data_values, nodata_val)
+                    valid_ratio = np.count_nonzero(valid_mask) / data_values.size
+
+                    if valid_ratio < 0.90:  # Less than 90% valid data
+                        raise ValueError(f"Tile has only {valid_ratio*100:.1f}% valid data")
+
+                    # Check for flat/empty tiles
+                    valid_data = data_values[valid_mask]
+                    if len(valid_data) > 0 and (np.max(valid_data) - np.min(valid_data)) < 1:
+                        raise ValueError("Tile appears flat/empty")
+
+                    # Success! Save to cache and return
+                    if use_cache:
+                        dem_data.rio.to_raster(str(cache_path))
+
+                    print(f"{indent}  Success at {resolution}m! Shape: {dem_data.shape}")
+                    return [dem_data]
+
+                except Exception as e:
+                    err_msg = str(e)
+
+                    if isinstance(e, ValueError) and "valid data" in err_msg:
+                        if not is_min_size:
+                            print(f"{indent}  {err_msg}, subdividing...")
+                            return _subdivide_tile(tile_geom, tile_id, depth)
+                        print(f"{indent}  {err_msg} at minimum tile size, trying next resolution.")
+                        break
+
+                    if isinstance(e, ValueError) and "flat/empty" in err_msg:
+                        print(f"{indent}  {err_msg}, trying next resolution.")
+                        break
+
+                    classification, error_code = _classify_fetch_error(e)
+                    is_retryable = classification == "retryable"
+
+                    if is_retryable and attempt < max_fetch_retries:
+                        sleep_seconds = 2 ** attempt
+                        err_label = error_code or type(e).__name__
+                        print(
+                            f"{indent}  Failed at {resolution}m (error: {err_label}); "
+                            f"retrying ({attempt + 1}/{max_fetch_retries}) in {sleep_seconds}s..."
+                        )
+                        time.sleep(sleep_seconds)
+                        continue
+
+                    err_label = error_code or type(e).__name__
+                    if is_retryable:
+                        if not is_min_size:
+                            print(
+                                f"{indent}  Failed at {resolution}m after {max_fetch_retries} attempts "
+                                f"(error: {err_label}), subdividing..."
+                            )
+                            return _subdivide_tile(tile_geom, tile_id, depth)
+                        print(
+                            f"{indent}  Failed at {resolution}m after {max_fetch_retries} attempts "
+                            f"(error: {err_label}) at minimum tile size, trying next resolution."
+                        )
+                    else:
+                        print(
+                            f"{indent}  Non-retryable failure at {resolution}m "
+                            f"(error: {err_label}), trying next resolution."
+                        )
+                    break
         
         # All resolutions failed
         if is_min_size:
@@ -636,7 +709,7 @@ STANDALONE_GEOJSON = {
     ],
 }
 
-STANDALONE_OUTPUT_DIR = "mountain_mesh_data/standalone"
+STANDALONE_OUTPUT_DIR = "/Volumes/sandisk1/data_cache/mountain_mesh_data/standalone"
 STANDALONE_OUTPUT_FILENAME = "extracted_dem.tif"
 
 

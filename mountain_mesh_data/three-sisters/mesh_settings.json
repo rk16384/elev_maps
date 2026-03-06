@@ -1,0 +1,48 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/../mountain_mesh_data/three-sisters/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.7254362793375821,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 30.13141201805651,
+    "light_azimuth": 336.92820886665385,
+    "light_distance": 100000.0,
+    "z_rotation": 334.50014827702336,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      -16450.15540049257,
+      -478.50493273416987,
+      8932.479851193708
+    ],
+    "focal_point": [
+      8514.74363836994,
+      10614.532638381123,
+      5006.572581054568
+    ],
+    "view_up": [
+      0.12313071026430188,
+      0.07315289109787455,
+      0.9896905994874515
+    ],
+    "view_angle": 27.279082058888715,
+    "clipping_range": [
+      3535.3153450901646,
+      57686.275949181254
+    ],
+    "parallel_scale": 12729.338116808416,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1852,
+    1074
+  ],
+  "timestamp": "2026-01-31T20:40:00.498038",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}

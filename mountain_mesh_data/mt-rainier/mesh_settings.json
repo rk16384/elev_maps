@@ -1,0 +1,48 @@
+{
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  },
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/mt-rainier/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 1.7254362793375821,
+    "smoothing_sigma": 0.0,
+    "light_elevation": 30.13141201805651,
+    "light_azimuth": 336.92820886665385,
+    "light_distance": 100000.0,
+    "z_rotation": 334.50014827702336,
+    "pixel_min": 2,
+    "pixel_max": 253
+  },
+  "camera": {
+    "position": [
+      -14856.238934128738,
+      -3786.827227636752,
+      8638.729934972871
+    ],
+    "focal_point": [
+      8730.22044262962,
+      9676.389273348776,
+      3725.976126300417
+    ],
+    "view_up": [
+      0.15713568421428797,
+      0.08378073007312206,
+      0.9840168525055464
+    ],
+    "view_angle": 27.279082058888715,
+    "clipping_range": [
+      2105.2111044621747,
+      58990.15998648995
+    ],
+    "parallel_scale": 12956.332751642622,
+    "parallel_projection": false
+  },
+  "window_size": [
+    1852,
+    1074
+  ],
+  "timestamp": "2026-02-20T22:16:09.838904"
+}

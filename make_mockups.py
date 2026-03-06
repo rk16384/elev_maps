@@ -290,7 +290,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--realism-strength",
         type=float,
-        default=0.45,
+        default=0.1,
         help="Blend amount for realism adjustments (0.0 to 1.0). Default: 0.45",
     )
     parser.add_argument(

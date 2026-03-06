@@ -1,0 +1,41 @@
+{
+  "dem_path": "/Users/ryankuhn/Documents/python_projects/elev_maps/mountain_mesh_data/crystal-mi/extracted_dem.tif",
+  "parameters": {
+    "vertical_exaggeration": 2.7445902457018656,
+    "smoothing_sigma": 0.2751351379413487,
+    "light_elevation": 12.439816553453399,
+    "light_azimuth": 193.38923431446779,
+    "light_distance": 100000.0
+  },
+  "camera": {
+    "position": [
+      2315.6474047062597,
+      -385.2227795383426,
+      735.2633727511
+    ],
+    "focal_point": [
+      860.2998879270386,
+      483.8372623038323,
+      872.4506167066511
+    ],
+    "view_up": [
+      0.06808897491491099,
+      -0.04331883527491894,
+      0.996738365874145
+    ],
+    "view_angle": 30.0,
+    "clipping_range": [
+      4.6698220266661865,
+      4669.8220266661865
+    ],
+    "parallel_scale": 1146.5146650841364,
+    "parallel_projection": false
+  },
+  "timestamp": "2025-12-16T22:00:17.450803",
+  "shadow_settings": {
+    "offset_x": 175,
+    "offset_y": 221,
+    "blur_radius": 49.84756097560975,
+    "shadow_gray": 159
+  }
+}
