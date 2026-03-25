@@ -239,6 +239,194 @@ except ImportError:
     mi = None
 
 
+def create_blender_hillshade(dem_data, hillshade_config: dict, output_dir: str) -> np.ndarray:
+    """Render a clay/plaster hillshade using Blender Cycles.
+
+    Returns an HxWx3 uint8 RGB numpy array matching the DEM dimensions.
+    """
+    import json
+    import re
+    import subprocess
+
+    BLENDER_PATH = "/Applications/Blender.app/Contents/MacOS/Blender"
+    RENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_clay_render.py")
+
+    blender_cfg = hillshade_config.get("blender_config", {})
+
+    dem_values = dem_data.values.squeeze().astype(np.float32)
+    h, w = dem_values.shape
+    print(f"  DEM shape: {h} x {w} ({h * w / 1e6:.1f} Mpx)")
+
+    nan_mask = np.isnan(dem_values) | (dem_values < -9000)
+    if nan_mask.any():
+        valid = dem_values[~nan_mask]
+        fill_val = float(np.nanmedian(valid)) if valid.size > 0 else 0.0
+        dem_values[nan_mask] = fill_val
+
+    vertical_exag = hillshade_config.get("vertical_exaggeration", 2.0)
+    dem_values = dem_values * vertical_exag
+
+    max_mesh_dim = blender_cfg.get("max_mesh_dimension", None)
+    if max_mesh_dim is not None:
+        longest = max(h, w)
+        if longest > max_mesh_dim:
+            scale = max_mesh_dim / longest
+            new_h, new_w = int(h * scale), int(w * scale)
+            from scipy.ndimage import zoom as scipy_zoom
+
+            dem_values = scipy_zoom(dem_values, (new_h / h, new_w / w), order=1)
+            print(f"  Downsampled mesh to: {dem_values.shape}")
+
+    elev_min = float(np.nanmin(dem_values))
+    elev_max = float(np.nanmax(dem_values))
+    elev_range = elev_max - elev_min
+    if elev_range == 0:
+        heightmap = np.zeros_like(dem_values)
+    else:
+        heightmap = (dem_values - elev_min) / elev_range
+
+    mesh_h, mesh_w = heightmap.shape
+    aspect_ratio = mesh_h / mesh_w
+
+    pad_frac = 0.05
+    pad_h = max(1, int(mesh_h * pad_frac))
+    pad_w = max(1, int(mesh_w * pad_frac))
+    heightmap = np.pad(heightmap, ((pad_h, pad_h), (pad_w, pad_w)), mode="edge")
+    padded_h, padded_w = heightmap.shape
+    print(f"  Padded heightmap: {mesh_h}x{mesh_w} -> {padded_h}x{padded_w} (pad {pad_h},{pad_w})")
+
+    blender_output_dir = os.path.join(output_dir, "_blender_work")
+    os.makedirs(blender_output_dir, exist_ok=True)
+
+    heightmap_path = os.path.join(blender_output_dir, "_heightmap.npy")
+    np.save(heightmap_path, heightmap)
+
+    render_config = {
+        "output_dir": blender_output_dir,
+        "heightmap_path": os.path.abspath(heightmap_path),
+        "sun_azimuth": float(hillshade_config.get("sun_azimuth", 315)),
+        "sun_elevation": float(hillshade_config.get("sun_altitude", 30)),
+        "sun_intensity": blender_cfg.get("sun_intensity", 4.0),
+        "sun_angle": blender_cfg.get("sun_angle", 8.0),
+        "ambient_strength": blender_cfg.get("ambient_strength", 0.20),
+        "base_color": blender_cfg.get("base_color", [0.85, 0.85, 0.85]),
+        "roughness": blender_cfg.get("roughness", 0.8),
+        "subsurface": blender_cfg.get("subsurface", 0.05),
+        "z_scale": blender_cfg.get("z_scale", 0.25),
+        "render_samples": blender_cfg.get("render_samples", 128),
+        "use_denoiser": blender_cfg.get("use_denoiser", True),
+        "render_resolution_x": blender_cfg.get("render_resolution_x", mesh_w),
+        "render_resolution_y": blender_cfg.get(
+            "render_resolution_y",
+            int(blender_cfg["render_resolution_x"] * aspect_ratio)
+            if "render_resolution_x" in blender_cfg
+            else mesh_h,
+        ),
+        "padding": {
+            "original_h": mesh_h,
+            "original_w": mesh_w,
+            "pad_h": pad_h,
+            "pad_w": pad_w,
+        },
+        "dem_metadata": {
+            "original_shape": [mesh_h, mesh_w],
+            "elev_min": elev_min,
+            "elev_max": elev_max,
+            "elev_range": elev_range,
+            "aspect_ratio": aspect_ratio,
+        },
+    }
+
+    config_path = os.path.join(blender_output_dir, "_render_config.json")
+    with open(config_path, "w") as f:
+        json.dump(render_config, f, indent=2)
+
+    render_w = render_config["render_resolution_x"]
+    render_h = render_config["render_resolution_y"]
+    total_pixels = render_w * render_h
+    mesh_verts = padded_h * padded_w
+    render_s = total_pixels * 22.3e-6
+    mesh_s = mesh_verts * 0.76e-6
+    est_s = render_s + mesh_s + 5
+    if est_s < 60:
+        est_str = f"~{est_s:.0f}s"
+    elif est_s < 3600:
+        est_str = f"~{est_s / 60:.0f} min"
+    else:
+        est_str = f"~{est_s / 3600:.1f} hr"
+
+    print(f"  Render resolution: {render_w} x {render_h} ({total_pixels / 1e6:.1f} Mpx)")
+    print(f"  Mesh vertices: {mesh_verts:,}")
+    print(f"  Estimated time: {est_str}")
+
+    cmd = [BLENDER_PATH, "--background", "--python", RENDER_SCRIPT, "--", config_path]
+
+    t0 = time.time()
+    progress_re = re.compile(r"PROGRESS elapsed=([\d.]+)s")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        universal_newlines=True,
+    )
+    for line in proc.stdout:
+        elapsed = time.time() - t0
+        line = line.rstrip()
+        progress_match = progress_re.search(line)
+        if progress_match:
+            render_elapsed = float(progress_match.group(1))
+            print(f"  [{elapsed:6.0f}s] Rendering... {render_elapsed:.0f}s elapsed", flush=True)
+        elif any(
+            k in line
+            for k in [
+                "Building mesh",
+                "Mesh built",
+                "Render completed",
+                "Using GPU",
+                "Heightmap shape",
+                "Z range",
+                "Rendering",
+                "[",
+                "Done",
+            ]
+        ):
+            print(f"  [{elapsed:6.0f}s] {line.strip()}", flush=True)
+
+    proc.wait()
+    elapsed = time.time() - t0
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"Blender exited with code {proc.returncode} after {elapsed:.1f}s")
+
+    print(f"  Blender finished in {elapsed:.1f}s")
+
+    rgb_path = os.path.join(blender_output_dir, "clay_render_rgb.png")
+    if not os.path.exists(rgb_path):
+        raise FileNotFoundError(f"Blender render output not found: {rgb_path}")
+
+    rgb_img = Image.open(rgb_path)
+
+    rw, rh = rgb_img.size
+    crop_left = int(rw * pad_w / padded_w)
+    crop_top = int(rh * pad_h / padded_h)
+    crop_right = rw - int(rw * pad_w / padded_w)
+    crop_bottom = rh - int(rh * pad_h / padded_h)
+    rgb_img = rgb_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+    print(f"  Cropped render: ({rw},{rh}) -> {rgb_img.size} (removed {pad_frac:.0%} padding)")
+
+    result = np.array(rgb_img.convert("RGB")).astype(np.uint8)
+
+    if result.shape[:2] != (h, w):
+        rgb_img_resized = rgb_img.resize((w, h), Image.Resampling.LANCZOS)
+        result = np.array(rgb_img_resized.convert("RGB")).astype(np.uint8)
+        print(f"  Resized render from {rgb_img.size} to ({w}, {h}) to match DEM")
+
+    print(f"  Blender hillshade shape: {result.shape}")
+    return result
+
+
 def create_hillshade(
     dem_data,
     sun_azimuth=315,
@@ -312,41 +500,37 @@ def create_hillshade(
             / (hillshade_data.max() - hillshade_data.min())
         ).astype(np.uint8)
 
-    # save hillshade_uint8 as a png
-    Image.fromarray(hillshade_uint8).save("hillshade_uint8.png")
     return hillshade_uint8
-    
-def add_water_to_hillshade(hillshade_uint8, water_mask=None, water_color=70, gaussian_blur_sigma=0):
-       
-    # Check if water color is RGB or grayscale
-    is_rgb_water = isinstance(water_color, tuple) and len(water_color) == 3 
 
-    # Apply water mask if provided
+
+def add_water_to_hillshade(hillshade_uint8, water_mask=None, water_color=70, gaussian_blur_sigma=0):
+    is_rgb_water = isinstance(water_color, tuple) and len(water_color) == 3
+    is_rgb_input = hillshade_uint8.ndim == 3 and hillshade_uint8.shape[2] == 3
+    output_is_rgb = is_rgb_water or is_rgb_input
+
+    if not is_rgb_input and output_is_rgb:
+        hillshade_uint8 = np.stack([hillshade_uint8] * 3, axis=-1)
+
     if water_mask is not None:
-        if is_rgb_water:
-            # Convert hillshade to RGB mode to support colored water
-            hillshade_rgb = np.stack([hillshade_uint8] * 3, axis=-1)
-            # Apply RGB water color
-            hillshade_rgb[water_mask] = water_color
-            hillshade_uint8 = hillshade_rgb
+        if output_is_rgb:
+            water_val = water_color if is_rgb_water else (water_color, water_color, water_color)
+            hillshade_uint8[water_mask] = water_val
         else:
-            # Apply grayscale water color
             hillshade_uint8[water_mask] = water_color
 
-    # Apply Gaussian blur if requested
     if gaussian_blur_sigma > 0:
         from scipy.ndimage import gaussian_filter
-        if is_rgb_water:
-            # Apply blur to each RGB channel separately
-            hillshade_uint8 = gaussian_filter(hillshade_uint8, sigma=(gaussian_blur_sigma, gaussian_blur_sigma, 0))
+
+        if output_is_rgb:
+            hillshade_uint8 = gaussian_filter(
+                hillshade_uint8, sigma=(gaussian_blur_sigma, gaussian_blur_sigma, 0)
+            )
         else:
             hillshade_uint8 = gaussian_filter(hillshade_uint8, sigma=gaussian_blur_sigma)
 
-    # Convert to PIL Image
-    if is_rgb_water:
-        return Image.fromarray(hillshade_uint8, 'RGB')
-    else:
-        return Image.fromarray(hillshade_uint8)
+    if output_is_rgb:
+        return Image.fromarray(hillshade_uint8, "RGB")
+    return Image.fromarray(hillshade_uint8)
 
 def create_elevation_coloring(dem_data, 
                                water_mask=None,
@@ -531,11 +715,11 @@ def create_printable_map(map_data: MapData,
     
     if combo_ratio > available_ratio:
         # Width limited
-        combo_width = available_width
+        combo_width = int(available_width)
         combo_height = int(combo_width / combo_ratio)
     else:
         # Height limited
-        combo_height = available_height
+        combo_height = int(available_height)
         combo_width = int(combo_height * combo_ratio)
     
     # Calculate scale factor from original shadow to fitted shadow
@@ -584,8 +768,18 @@ def create_printable_map(map_data: MapData,
         
         # Paste shadow first (behind hillshade)
         background.paste(shadow_img_resized, (shadow_x, shadow_y))
-    
-    
+
+        # Shadow hole-punch is low-res and can misalign vs hillshade; white-patch under
+        # hillshade with a slightly dilated mask so no dark edge bleeds through.
+        if state_mask_resized:
+            from scipy.ndimage import binary_dilation
+
+            mask_arr = np.array(state_mask_resized) > 0
+            dilated = binary_dilation(mask_arr, iterations=3)
+            dilated_mask = Image.fromarray((dilated * 255).astype(np.uint8), "L")
+            white_patch = Image.new("RGB", (hillshade_width, hillshade_height), "white")
+            background.paste(white_patch, (hillshade_x, hillshade_y), dilated_mask)
+
     # Paste hillshade
     if border:
         border_width = int(hillshade_width / 500)
@@ -795,6 +989,23 @@ def generate_map(create_debug_grid=False,
     # Reproject DEM to Web Mercator for accurate distance calculations
     map_data.dem_data = reproject_to_web_mercator(map_data.dem_data)
 
+    max_dem_dim = map_data.common_config.get("max_dem_dimension")
+    if max_dem_dim is not None:
+        dem_shape = map_data.dem_data.shape
+        if len(dem_shape) == 3:
+            _, dh, dw = dem_shape
+        else:
+            dh, dw = dem_shape
+        longest = max(dh, dw)
+        if longest > max_dem_dim:
+            scale = max_dem_dim / longest
+            nh, nw = int(dh * scale), int(dw * scale)
+            map_data.dem_data = downsample_dem(map_data.dem_data, target_shape=(nh, nw))
+            print(
+                f"Early DEM downsample for max_dem_dimension={max_dem_dim}: "
+                f"({dh},{dw}) -> ({nh},{nw})"
+            )
+
     # DEBUGsave dem data to image
     dem_values = map_data.dem_data.values.squeeze()
     # Normalize to 0-255
@@ -842,10 +1053,10 @@ def generate_map(create_debug_grid=False,
         # Save shadow offsets separately
         shadow_offsets_path = map_data.get_cache_path('shadow_offsets', '.pkl')
         import pickle
+
         with open(shadow_offsets_path, 'wb') as f:
             pickle.dump(map_data.shadow_offsets, f)
 
-            # save shadow to image
     save_to_image(map_data.shadow_img, 'shadow_debug', map_data)
 
     # --- WATER MASK ---
@@ -881,9 +1092,28 @@ def generate_map(create_debug_grid=False,
     do_elevation_coloring = map_data.common_config['do_elevation_coloring']
     
     if do_hillshade:
+        render_method = map_data.hillshade_config.get('render_method', 'og')
+
         if map_data.use_cache_hillshade and map_data.cache_exists('hillshade'):
             print("Loading hillshade from cache...")
             map_data.hillshade = map_data.load_from_cache('hillshade')
+        elif render_method == 'blender':
+            print("Creating hillshade (Blender clay renderer)...")
+            try:
+                map_data.hillshade = create_blender_hillshade(
+                    dem_data=map_data.dem_data,
+                    hillshade_config=map_data.hillshade_config,
+                    output_dir=map_data.output_dir,
+                )
+                print("Blender hillshade created successfully")
+            except Exception as e:
+                print(f"Blender hillshade creation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+            if map_data.use_cache_hillshade:
+                map_data.save_to_cache('hillshade', map_data.hillshade)
         else:
             print("Creating hillshade...")
             try:
@@ -899,7 +1129,7 @@ def generate_map(create_debug_grid=False,
                 import traceback
                 traceback.print_exc()
                 raise
-            
+
             if map_data.use_cache_hillshade:
                 map_data.save_to_cache('hillshade', map_data.hillshade)
 
@@ -907,9 +1137,15 @@ def generate_map(create_debug_grid=False,
 
         # Add water to hillshade
         if map_data.include_water:
-            map_data.hillshade = add_water_to_hillshade(map_data.hillshade, map_data.water_mask, map_data.hillshade_config['water_color'], map_data.hillshade_config['gaussian_blur_sigma'])
+            map_data.hillshade = add_water_to_hillshade(
+                map_data.hillshade,
+                map_data.water_mask,
+                map_data.hillshade_config['water_color'],
+                map_data.hillshade_config['gaussian_blur_sigma'],
+            )
         else:
-            map_data.hillshade = Image.fromarray(map_data.hillshade)
+            if not isinstance(map_data.hillshade, Image.Image):
+                map_data.hillshade = Image.fromarray(np.asarray(map_data.hillshade))
 
         save_to_image(map_data.hillshade, 'hillshade_water_debug', map_data)
 
