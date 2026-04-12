@@ -24,24 +24,71 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 import rasterio
+from rasterio.warp import transform_geom
 from PIL import Image
 from scipy.ndimage import gaussian_filter
-from shapely.geometry import shape
+from shapely.geometry import Polygon, mapping, shape
 
+from dem_raster_utils import fill_invalid_nearest
 from extract_dem_data import extract_dem_from_geojson, extract_dem_mosaic_from_geojson
+
+
+def _dem_invalid_to_nan(arr: np.ndarray, nodata: float | int | None) -> None:
+    """In-place: mark raster nodata and common sentinels as NaN (do not use 0 for holes)."""
+    if nodata is not None:
+        if isinstance(nodata, (float, np.floating)) and np.isnan(nodata):
+            pass
+        else:
+            arr[arr == nodata] = np.nan
+    arr[arr == -9999] = np.nan
 
 
 # Base directory for all location data
 BASE_DIR = Path("/Volumes/sandisk1/data_cache/mountain_mesh_data")
 
 
+def resolve_dem_path(location_dir: Path) -> Path:
+    """
+    Prefer mesh_settings.json 'dem_filename' (basename under location_dir) when present
+    and the file exists; otherwise extracted_dem.tif.
+    """
+    default = location_dir / "extracted_dem.tif"
+    sf = location_dir / "mesh_settings.json"
+    if not sf.exists():
+        return default
+    try:
+        with open(sf) as f:
+            s = json.load(f)
+        name = s.get("dem_filename")
+        if isinstance(name, str) and name.strip():
+            alt = location_dir / name.strip()
+            if alt.is_file():
+                return alt
+            print(
+                f"Warning: mesh_settings.json dem_filename {name!r} not found; using {default.name}",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+    return default
+
+
 class InteractiveMeshViewer:
-    def __init__(self, location_dir: Path, polygon_coords: list, method: str = "radius"):
+    def __init__(
+        self,
+        location_dir: Path,
+        polygon_coords: list,
+        method: str = "radius",
+        *,
+        dem_path: Path | None = None,
+        vertical_bias_percent: float = 0.0,
+    ):
         self.location_dir = location_dir
         self.polygon_coords = polygon_coords
         self.method = method
-        
-        self.dem_path = location_dir / "extracted_dem.tif"
+
+        self.dem_path = dem_path if dem_path is not None else resolve_dem_path(location_dir)
+        self.vertical_bias_percent = float(vertical_bias_percent)
         self.settings_file = location_dir / "mesh_settings.json"
         
         self.dem_data = None
@@ -66,6 +113,8 @@ class InteractiveMeshViewer:
             "z_rotation": 0.0,  # Z-axis rotation in degrees
             "pixel_min": 2,  # Minimum pixel value for mesh (background stays white)
             "pixel_max": 253,  # Maximum pixel value for mesh
+            # Nearest-neighbor fill for small mosaic holes (pixels); 0 = off
+            "hole_fill_max_px": 48.0,
         }
         
         # Stored camera settings (loaded from file)
@@ -94,6 +143,9 @@ class InteractiveMeshViewer:
             self.transform = src.transform
             self.bounds = src.bounds
             self.crs = src.crs
+            src_nodata = src.nodata
+        
+        _dem_invalid_to_nan(self.dem_data, src_nodata)
         
         original_shape = self.dem_data.shape
         
@@ -109,7 +161,7 @@ class InteractiveMeshViewer:
             print(f"Downsampling DEM for interactive viewing: {self.dem_data.shape[1]}x{self.dem_data.shape[0]} -> {new_width}x{new_height}")
             
             # Handle nodata before downsampling
-            nodata_mask = (self.dem_data == -9999) | np.isnan(self.dem_data)
+            nodata_mask = ~np.isfinite(self.dem_data)
             self.dem_data[nodata_mask] = np.nan
             
             # Downsample using bilinear interpolation
@@ -126,14 +178,20 @@ class InteractiveMeshViewer:
                 self.transform.f
             )
             
-        # Handle nodata values
-        self.dem_data = np.nan_to_num(self.dem_data, nan=0.0)
+        # Keep NaN for invalid pixels — converting to 0 creates fake "sea level" inside the polygon
+        # and vertical cliff artifacts between real terrain and holes in the mosaic.
         
         print(f"Loaded DEM: {self.dem_path}")
         if original_shape != self.dem_data.shape:
             print(f"  Original shape: {original_shape}")
         print(f"  Shape: {self.dem_data.shape}")
-        print(f"  Elevation range: {np.nanmin(self.dem_data):.1f} to {np.nanmax(self.dem_data):.1f}")
+        valid = np.isfinite(self.dem_data)
+        if np.any(valid):
+            print(
+                f"  Elevation range (valid pixels): {np.nanmin(self.dem_data):.1f} to {np.nanmax(self.dem_data):.1f}"
+            )
+        else:
+            print("  Elevation range: (no valid pixels)")
     
     def _load_settings(self):
         """Load previous settings from mesh_settings.json if it exists."""
@@ -165,6 +223,31 @@ class InteractiveMeshViewer:
         except Exception as e:
             print(f"Warning: Could not load settings: {e}")
     
+    def _polygon_shape_in_dem_crs(self):
+        """GeoJSON vertices are WGS84 lon/lat; DEM may be projected (e.g. EPSG:6428)."""
+        polygon = Polygon(self.polygon_coords)
+        if self.crs is None or self.crs.is_geographic:
+            return polygon
+        geom = transform_geom("EPSG:4326", self.crs, mapping(polygon))
+        return shape(geom)
+
+    def _meters_per_pixel_xy(self) -> tuple[float, float]:
+        """East/north pixel spacing in meters (elevation is meters in typical DEMs)."""
+        if self.crs is not None and self.crs.is_geographic:
+            center_lat = (self.bounds.top + self.bounds.bottom) / 2
+            deg_to_m_lat = 111320.0
+            deg_to_m_lon = 111320.0 * np.cos(np.radians(center_lat))
+            return abs(self.transform.a) * deg_to_m_lon, abs(self.transform.e) * deg_to_m_lat
+        try:
+            from pyproj import CRS as PyProjCRS
+
+            p = PyProjCRS.from_user_input(self.crs)
+            unit = (p.axis_info[0].unit_name or "metre").lower()
+            m_per_u = 0.304800609601219 if "foot" in unit else 1.0
+            return abs(self.transform.a) * m_per_u, abs(self.transform.e) * m_per_u
+        except Exception:
+            return abs(self.transform.a), abs(self.transform.e)
+
     def _create_polygon_mask(self, erode_pixels: int = 2) -> np.ndarray:
         """Create a boolean mask from polygon coordinates.
         
@@ -174,12 +257,11 @@ class InteractiveMeshViewer:
         """
         from rasterio.features import geometry_mask
         from scipy.ndimage import binary_erosion
-        from shapely.geometry import Polygon
         
         if self.polygon_coords is None:
             return np.ones(self.dem_data.shape, dtype=bool)
         
-        polygon = Polygon(self.polygon_coords)
+        polygon = self._polygon_shape_in_dem_crs()
         
         # Create mask using rasterio (True = inside polygon)
         mask = ~geometry_mask(
@@ -197,19 +279,28 @@ class InteractiveMeshViewer:
         
     def _create_mesh(self):
         """Create PyVista mesh from DEM data with current smoothing."""
-        # Apply gaussian smoothing
-        smoothed = gaussian_filter(self.dem_data, sigma=self.params["smoothing_sigma"])
+        elev = np.asarray(self.dem_data, dtype=np.float32)
+        mx = float(self.params.get("hole_fill_max_px", 0.0))
+        if mx > 0.0:
+            elev = fill_invalid_nearest(elev, max_dist_px=mx)
+
+        sigma = float(self.params["smoothing_sigma"])
+        if sigma > 0.0:
+            valid = np.isfinite(elev)
+            if np.any(valid):
+                fill = float(np.nanmedian(self.dem_data[valid]))
+            else:
+                fill = 0.0
+            filled = np.where(valid, elev, fill)
+            smoothed = gaussian_filter(filled, sigma=sigma)
+            smoothed = np.where(valid, smoothed, np.nan)
+        else:
+            smoothed = elev
         
         # Create coordinate grids in real-world units (meters)
         nrows, ncols = smoothed.shape
         
-        # Calculate pixel size in meters (approximate using center latitude)
-        center_lat = (self.bounds.top + self.bounds.bottom) / 2
-        deg_to_m_lat = 111320  # meters per degree latitude
-        deg_to_m_lon = 111320 * np.cos(np.radians(center_lat))  # meters per degree longitude
-        
-        pixel_width_m = abs(self.transform.a) * deg_to_m_lon
-        pixel_height_m = abs(self.transform.e) * deg_to_m_lat
+        pixel_width_m, pixel_height_m = self._meters_per_pixel_xy()
         
         # Create coordinate grids in meters
         x = np.linspace(0, ncols * pixel_width_m, ncols)
@@ -220,12 +311,15 @@ class InteractiveMeshViewer:
         y = np.flipud(y)
         
         # Apply vertical exaggeration
+        valid_elev = np.isfinite(smoothed)
         z = smoothed * self.params["vertical_exaggeration"]
         
         # Apply polygon mask - set outside values to NaN
         if self.polygon_coords is not None:
             mask = self._create_polygon_mask()
-            z = np.where(mask, z, np.nan)
+            z = np.where(mask & valid_elev, z, np.nan)
+        else:
+            z = np.where(valid_elev, z, np.nan)
         
         # Create structured grid
         mesh = pv.StructuredGrid(x, y, z)
@@ -236,6 +330,13 @@ class InteractiveMeshViewer:
             point_valid = ~np.isnan(mesh.points[:, 2])
             # adjacent_cells=False ensures only cells with ALL valid vertices are kept
             mesh = mesh.extract_points(point_valid, adjacent_cells=False)
+        
+        if mesh.n_points == 0:
+            raise ValueError(
+                "Terrain mesh has zero points after polygon clip. "
+                "Check that polygon.json (WGS84) overlaps the DEM extent, "
+                "or that the DEM CRS matches your workflow."
+            )
         
         return mesh
     
@@ -374,7 +475,15 @@ class InteractiveMeshViewer:
                 preserved = {}
 
         settings = {**preserved, **core_settings}
-        
+        default_dem = self.location_dir / "extracted_dem.tif"
+        try:
+            if self.dem_path.resolve() == default_dem.resolve():
+                settings.pop("dem_filename", None)
+            else:
+                settings["dem_filename"] = self.dem_path.name
+        except Exception:
+            pass
+
         # Print to terminal
         print("\n" + "=" * 60)
         print("CURRENT SETTINGS")
@@ -437,6 +546,9 @@ class InteractiveMeshViewer:
         with rasterio.open(self.dem_path) as src:
             full_dem = src.read(1).astype(np.float32)
             full_transform = src.transform
+            full_nodata = src.nodata
+        
+        _dem_invalid_to_nan(full_dem, full_nodata)
         
         # Downsample if still too large, but at higher resolution than interactive
         current_max = max(full_dem.shape)
@@ -451,7 +563,7 @@ class InteractiveMeshViewer:
             print(f"  Downsampling for render: {full_dem.shape[1]}x{full_dem.shape[0]} -> {new_width}x{new_height}")
             
             # Handle nodata before downsampling
-            nodata_mask = (full_dem == -9999) | np.isnan(full_dem)
+            nodata_mask = ~np.isfinite(full_dem)
             full_dem[nodata_mask] = np.nan
             full_dem = zoom(full_dem, scale_factor, order=1, mode='nearest')
             
@@ -463,9 +575,6 @@ class InteractiveMeshViewer:
                 full_transform.e / scale_factor,
                 full_transform.f
             )
-        
-        # Handle nodata values
-        full_dem = np.nan_to_num(full_dem, nan=0.0)
         
         # Temporarily use high-res DEM
         self.dem_data = full_dem
@@ -704,13 +813,15 @@ class InteractiveMeshViewer:
         img_height, img_width = img.shape[:2]
         img_center_y = img_height / 2
         img_center_x = img_width / 2
+        bias_px = (self.vertical_bias_percent / 100.0) * img_height
         
-        # Calculate shift needed to center the mesh
-        shift_y = int(round(img_center_y - mesh_center_y))
+        # Positive bias percent moves mesh upward in the frame.
+        shift_y = int(round(img_center_y - mesh_center_y - bias_px))
         shift_x = int(round(img_center_x - mesh_center_x))
         
         print(f"  Mesh bounding box: ({left}, {top}) to ({right}, {bottom})")
         print(f"  Mesh size: {mesh_width}x{mesh_height}")
+        print(f"  Vertical bias (%): {self.vertical_bias_percent}")
         print(f"  Centering shift: ({shift_x}, {shift_y})")
         
         # Create new white image
@@ -991,12 +1102,31 @@ Example:
         action="store_true",
         help="Also export the generated terrain mesh as STL during save/render.",
     )
+    parser.add_argument(
+        "--dem-file",
+        type=str,
+        default=None,
+        help=(
+            "DEM filename under the location folder (e.g. extracted_dem_usgs_style_1m.tif) "
+            "or absolute path; overrides mesh_settings dem_filename."
+        ),
+    )
+    parser.add_argument(
+        "--vertical-bias-percent",
+        type=float,
+        default=0.0,
+        help="Shift mesh vertically as percent of image height; positive moves mesh up.",
+    )
     args = parser.parse_args()
     
     # Set up paths
     location_dir = BASE_DIR / args.location_name
     polygon_file = location_dir / "polygon.json"
-    dem_file = location_dir / "extracted_dem.tif"
+    if args.dem_file:
+        raw = Path(args.dem_file)
+        dem_file = raw if raw.is_absolute() else location_dir / raw
+    else:
+        dem_file = resolve_dem_path(location_dir)
     
     # Check if location folder exists
     if not location_dir.exists():
@@ -1023,26 +1153,40 @@ Example:
         polygon_coords = load_radius_from_geojson(polygon_coords)
     print(f"Loaded polygon with {len(polygon_coords)} vertices")
     
-    # Check if DEM exists, if not extract it using mosaic approach
+    # Check if DEM exists; only auto-fetch USGS mosaic for default extracted_dem.tif
+    default_dem = location_dir / "extracted_dem.tif"
     if not dem_file.exists():
+        if dem_file.resolve() != default_dem.resolve():
+            print(f"Error: DEM not found: {dem_file}", file=sys.stderr)
+            print(
+                "  Create it (e.g. pitkin_dem_pipeline / pitkin_dem_postprocess) or omit dem_filename.",
+                file=sys.stderr,
+            )
+            return 1
         print(f"\nDEM not found. Extracting DEM data with mosaic approach...")
         # Use mosaic extraction to get highest available resolution (1m > 3m > 10m)
         # max_dimension=4000 ensures the final DEM is manageable for interactive viewing
         result, _ = extract_dem_mosaic_from_geojson(
-            geojson_data, 
-            str(dem_file), 
+            geojson_data,
+            str(default_dem),
             polygon_coords,
             resolutions=[1, 3, 10],  # Prioritize highest resolution
-            max_dimension=4000  # Limit to 4000px on longest side for interactive use
+            max_dimension=4000,  # Limit to 4000px on longest side for interactive use
         )
         if result is None:
             print("Error: Failed to extract DEM data.")
             return 1
+        dem_file = default_dem
     else:
         print(f"Using existing DEM: {dem_file}")
     
     # Launch viewer
-    viewer = InteractiveMeshViewer(location_dir, polygon_coords)
+    viewer = InteractiveMeshViewer(
+        location_dir,
+        polygon_coords,
+        dem_path=dem_file,
+        vertical_bias_percent=args.vertical_bias_percent,
+    )
     viewer.run(auto_accept=args.auto_accept, export_stl=args.export_stl)
     return 0
 

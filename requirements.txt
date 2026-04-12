@@ -4,4 +4,4 @@ conda create -n rvt_env python=3.11 -c conda-forge --strict-channel-priority
 conda activate rvt_env
 conda install -c conda-forge gdal rasterio xdem libnetcdf netcdf4 geopandas pyproj numpy scipy pillow
 python -m pip install --upgrade pip setuptools wheel
-pip install rvt-py py3dep pynhd pygeohydro
+pip install rvt-py py3dep pynhd pygeohydro laspy
