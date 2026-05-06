@@ -28,6 +28,52 @@ POSTER_WIDTH_IN = 20.0
 POSTER_HEIGHT_IN = 16.0
 MARGIN_IN = 0.125
 
+# Default typography sizing as a percent of the final image height.
+# These percentages are tuned to match the prior visual weights at a
+# ~3085 px tall canvas (e.g. title 120 px / 3085 ≈ 3.89%).
+DEFAULT_TITLE_FONT_PCT = 3.89
+DEFAULT_SUBTITLE_FONT_PCT = 2.59
+DEFAULT_LINE_SPACING_PCT = 1.62
+DEFAULT_BOTTOM_OFFSET_PCT = 3.24
+DEFAULT_CONTENT_GAP_PCT = 0.16
+DEFAULT_TITLE_WEIGHT_BOOST_PCT = 0.0325
+DEFAULT_SUBTITLE_WEIGHT_BOOST_PCT = 0.0325
+
+# Legacy *_px / *_size values were authored against a roughly 3085 px tall
+# canvas (4096 wide @ ~1.596 aspect, trimmed/padded to 5:4). Treat any such
+# value as referenced to this height so it becomes an implicit percentage
+# and scales correctly when the canvas grows.
+LEGACY_PX_REFERENCE_HEIGHT = 3085
+
+
+def _pct_to_px(pct: float, image_height: int, *, minimum: int = 1) -> int:
+    """Convert a percent-of-image-height value to a pixel count."""
+    return max(minimum, int(round(float(pct) * image_height / 100.0)))
+
+
+def _resolve_size(
+    pct_value: float | None,
+    px_value: int | None,
+    image_height: int,
+    *,
+    default_pct: float,
+    minimum: int = 1,
+) -> tuple[int, float, str]:
+    """Resolve a typography size to pixels, always via percent-of-height.
+
+    Precedence: explicit pct -> legacy px (treated as percent of the legacy
+    reference height) -> default pct. Returns (pixels, pct, source) where
+    source is one of {"pct", "px", "default"}.
+    """
+    if pct_value is not None:
+        pct = float(pct_value)
+        return _pct_to_px(pct, image_height, minimum=minimum), pct, "pct"
+    if px_value is not None:
+        pct = float(px_value) / float(LEGACY_PX_REFERENCE_HEIGHT) * 100.0
+        return _pct_to_px(pct, image_height, minimum=minimum), pct, "px"
+    pct = float(default_pct)
+    return _pct_to_px(pct, image_height, minimum=minimum), pct, "default"
+
 
 def find_latest_shadow_image(folder: Path) -> Path | None:
     images = list(folder.glob("shadow_*.png"))
@@ -407,6 +453,51 @@ def main() -> int:
         type=int,
         help="Optional faux-bold x-offset for subtitle text in pixels.",
     )
+    # Percentage-based sizing flags. These take precedence over the *_px
+    # variants and scale automatically with the final image height so
+    # typography stays visually consistent across render resolutions.
+    parser.add_argument(
+        "--title-font-pct",
+        dest="title_font_pct",
+        type=float,
+        help="Title font size as percent of image height (e.g. 3.89).",
+    )
+    parser.add_argument(
+        "--subtitle-font-pct",
+        dest="subtitle_font_pct",
+        type=float,
+        help="Subtitle font size as percent of image height (e.g. 2.59).",
+    )
+    parser.add_argument(
+        "--line-spacing-pct",
+        dest="line_spacing_pct",
+        type=float,
+        help="Spacing between title and subtitle as percent of image height.",
+    )
+    parser.add_argument(
+        "--bottom-offset-pct",
+        dest="bottom_offset_pct",
+        type=float,
+        help="Bottom offset reserve as percent of image height.",
+    )
+    parser.add_argument(
+        "--content-gap-pct",
+        dest="content_gap_pct",
+        type=float,
+        help="Gap between content bottom and text block as percent of image height.",
+    )
+    parser.add_argument(
+        "--title-weight-boost-pct",
+        dest="title_weight_boost_pct",
+        type=float,
+        help="Title faux-bold x-offset as percent of image height.",
+    )
+    parser.add_argument(
+        "--subtitle-weight-boost-pct",
+        dest="subtitle_weight_boost_pct",
+        type=float,
+        help="Subtitle faux-bold x-offset as percent of image height.",
+    )
     parser.add_argument(
         "--overwrite-title-settings",
         "--overwrite_title_settings",
@@ -450,22 +541,6 @@ def main() -> int:
         )
         return 1
 
-    title_font_size = int(title_settings.get("title_font_size", 120))
-    subtitle_font_size = int(title_settings.get("subtitle_font_size", 80))
-    title_weight_boost_px = (
-        int(args.title_weight_boost_px)
-        if args.title_weight_boost_px is not None
-        else int(title_settings.get("title_weight_boost_px", 1))
-    )
-    subtitle_weight_boost_px = (
-        int(args.subtitle_weight_boost_px)
-        if args.subtitle_weight_boost_px is not None
-        else int(title_settings.get("subtitle_weight_boost_px", 1))
-    )
-    line_spacing_px = int(title_settings.get("line_spacing_px", 50))
-    bottom_offset_px = int(title_settings.get("bottom_offset_px", 100))
-    content_gap_px = int(title_settings.get("content_gap_px", 5))
-
     title_color = as_rgb(title_settings.get("title_color"), default=(50, 50, 50))
     subtitle_color = as_rgb(title_settings.get("subtitle_color"), default=(120, 120, 120))
 
@@ -478,20 +553,143 @@ def main() -> int:
             print(f"Error: invalid aspect ratio '{ratio_str}': {exc}")
             return 1
 
+    # Source pct/px values for each typography field. CLI overrides settings,
+    # which override hardcoded defaults. Pct beats px when both are present.
+    def _pick(cli_val: Any, settings_key: str) -> Any:
+        if cli_val is not None:
+            return cli_val
+        return title_settings.get(settings_key)
+
+    title_font_pct_in = _pick(args.title_font_pct, "title_font_pct")
+    subtitle_font_pct_in = _pick(args.subtitle_font_pct, "subtitle_font_pct")
+    line_spacing_pct_in = _pick(args.line_spacing_pct, "line_spacing_pct")
+    bottom_offset_pct_in = _pick(args.bottom_offset_pct, "bottom_offset_pct")
+    content_gap_pct_in = _pick(args.content_gap_pct, "content_gap_pct")
+    title_weight_boost_pct_in = _pick(
+        args.title_weight_boost_pct, "title_weight_boost_pct"
+    )
+    subtitle_weight_boost_pct_in = _pick(
+        args.subtitle_weight_boost_pct, "subtitle_weight_boost_pct"
+    )
+
+    title_font_px_in = title_settings.get("title_font_size")
+    subtitle_font_px_in = title_settings.get("subtitle_font_size")
+    line_spacing_px_in = title_settings.get("line_spacing_px")
+    bottom_offset_px_in = title_settings.get("bottom_offset_px")
+    content_gap_px_in = title_settings.get("content_gap_px")
+    title_weight_boost_px_in = (
+        args.title_weight_boost_px
+        if args.title_weight_boost_px is not None
+        else title_settings.get("title_weight_boost_px")
+    )
+    subtitle_weight_boost_px_in = (
+        args.subtitle_weight_boost_px
+        if args.subtitle_weight_boost_px is not None
+        else title_settings.get("subtitle_weight_boost_px")
+    )
+
+    # Open + aspect-correct the source image before resolving sizes so that
+    # any pct values are taken against the final canvas height.
+    try:
+        base_image = Image.open(input_path).convert("RGB")
+        if target_ratio is not None:
+            base_image = enforce_aspect_ratio(base_image, target_ratio=target_ratio)
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    image_height = base_image.size[1]
+
+    title_font_size, title_font_pct_used, title_font_source = _resolve_size(
+        title_font_pct_in, title_font_px_in, image_height,
+        default_pct=DEFAULT_TITLE_FONT_PCT,
+    )
+    subtitle_font_size, subtitle_font_pct_used, subtitle_font_source = _resolve_size(
+        subtitle_font_pct_in, subtitle_font_px_in, image_height,
+        default_pct=DEFAULT_SUBTITLE_FONT_PCT,
+    )
+    line_spacing_px, line_spacing_pct_used, line_spacing_source = _resolve_size(
+        line_spacing_pct_in, line_spacing_px_in, image_height,
+        default_pct=DEFAULT_LINE_SPACING_PCT,
+    )
+    bottom_offset_px, bottom_offset_pct_used, bottom_offset_source = _resolve_size(
+        bottom_offset_pct_in, bottom_offset_px_in, image_height,
+        default_pct=DEFAULT_BOTTOM_OFFSET_PCT,
+    )
+    content_gap_px, content_gap_pct_used, content_gap_source = _resolve_size(
+        content_gap_pct_in, content_gap_px_in, image_height,
+        default_pct=DEFAULT_CONTENT_GAP_PCT,
+    )
+    # Weight-boost values can legitimately be 0 (no faux-bold), so allow
+    # minimum=0 here while still honoring the pct/px precedence.
+    title_weight_boost_px, title_weight_boost_pct_used, title_weight_boost_source = _resolve_size(
+        title_weight_boost_pct_in, title_weight_boost_px_in, image_height,
+        default_pct=DEFAULT_TITLE_WEIGHT_BOOST_PCT, minimum=0,
+    )
+    subtitle_weight_boost_px, subtitle_weight_boost_pct_used, subtitle_weight_boost_source = _resolve_size(
+        subtitle_weight_boost_pct_in, subtitle_weight_boost_px_in, image_height,
+        default_pct=DEFAULT_SUBTITLE_WEIGHT_BOOST_PCT, minimum=0,
+    )
+
+    print(f"Image height (post aspect-ratio): {image_height} px")
+    print("Resolved typography (source -> pct -> px):")
+    rows = (
+        ("title_font", title_font_pct_used, title_font_size, title_font_source, title_font_px_in),
+        ("subtitle_font", subtitle_font_pct_used, subtitle_font_size, subtitle_font_source, subtitle_font_px_in),
+        ("line_spacing", line_spacing_pct_used, line_spacing_px, line_spacing_source, line_spacing_px_in),
+        ("bottom_offset", bottom_offset_pct_used, bottom_offset_px, bottom_offset_source, bottom_offset_px_in),
+        ("content_gap", content_gap_pct_used, content_gap_px, content_gap_source, content_gap_px_in),
+        ("title_weight_boost", title_weight_boost_pct_used, title_weight_boost_px, title_weight_boost_source, title_weight_boost_px_in),
+        ("subtitle_weight_boost", subtitle_weight_boost_pct_used, subtitle_weight_boost_px, subtitle_weight_boost_source, subtitle_weight_boost_px_in),
+    )
+    for label, pct_used, px, source, raw_px in rows:
+        if source == "pct":
+            print(f"  {label}: pct={pct_used:g}% -> {px} px")
+        elif source == "px":
+            print(
+                f"  {label}: legacy {raw_px} px "
+                f"(@ ref {LEGACY_PX_REFERENCE_HEIGHT} = {pct_used:.3g}%) -> {px} px"
+            )
+        else:
+            print(f"  {label}: default {pct_used:g}% -> {px} px")
+
     effective_title_settings: dict[str, Any] = {
         "font_family": font_family,
         "elevation_text": subtitle,
-        "title_font_size": title_font_size,
-        "subtitle_font_size": subtitle_font_size,
         "title_color": [title_color[0], title_color[1], title_color[2]],
         "subtitle_color": [subtitle_color[0], subtitle_color[1], subtitle_color[2]],
-        "title_weight_boost_px": title_weight_boost_px,
-        "subtitle_weight_boost_px": subtitle_weight_boost_px,
-        "line_spacing_px": line_spacing_px,
-        "bottom_offset_px": bottom_offset_px,
-        "content_gap_px": content_gap_px,
         "aspect_ratio_default": str(ratio_str) if ratio_str else "4:3",
     }
+
+    # When a field is sized via pct, persist the pct (and drop the px sibling).
+    # Otherwise persist the absolute px so existing tunings are preserved.
+    def _persist_size(
+        key_base: str,
+        pct_used: float | None,
+        px_value: int,
+    ) -> None:
+        pct_key = f"{key_base}_pct"
+        px_key_options = [f"{key_base}_size", f"{key_base}_px"]
+        if pct_used is not None:
+            effective_title_settings[pct_key] = float(pct_used)
+        else:
+            for key in px_key_options:
+                if key in title_settings:
+                    effective_title_settings[key] = int(px_value)
+                    return
+            effective_title_settings[px_key_options[-1]] = int(px_value)
+
+    _persist_size("title_font", title_font_pct_used, title_font_size)
+    _persist_size("subtitle_font", subtitle_font_pct_used, subtitle_font_size)
+    _persist_size("line_spacing", line_spacing_pct_used, line_spacing_px)
+    _persist_size("bottom_offset", bottom_offset_pct_used, bottom_offset_px)
+    _persist_size("content_gap", content_gap_pct_used, content_gap_px)
+    _persist_size(
+        "title_weight_boost", title_weight_boost_pct_used, title_weight_boost_px
+    )
+    _persist_size(
+        "subtitle_weight_boost", subtitle_weight_boost_pct_used, subtitle_weight_boost_px
+    )
 
     title_settings_missing = "title_settings" not in settings
     should_overwrite_title_settings = args.overwrite_title_settings
@@ -508,9 +706,6 @@ def main() -> int:
             print("Overwrote title_settings in mesh_settings.json")
 
     try:
-        base_image = Image.open(input_path).convert("RGB")
-        if target_ratio is not None:
-            base_image = enforce_aspect_ratio(base_image, target_ratio=target_ratio)
         result = draw_centered_title(
             base_image,
             title=args.title,

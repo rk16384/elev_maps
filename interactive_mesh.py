@@ -82,6 +82,8 @@ class InteractiveMeshViewer:
         *,
         dem_path: Path | None = None,
         vertical_bias_percent: float = 0.0,
+        render_max_dimension: int = 8192,
+        render_max_mesh_dimension: int = 8000,
     ):
         self.location_dir = location_dir
         self.polygon_coords = polygon_coords
@@ -89,6 +91,8 @@ class InteractiveMeshViewer:
 
         self.dem_path = dem_path if dem_path is not None else resolve_dem_path(location_dir)
         self.vertical_bias_percent = float(vertical_bias_percent)
+        self.render_max_dimension = int(render_max_dimension)
+        self.render_max_mesh_dimension = int(render_max_mesh_dimension)
         self.settings_file = location_dir / "mesh_settings.json"
         
         self.dem_data = None
@@ -510,6 +514,8 @@ class InteractiveMeshViewer:
         self._render_high_res(
             camera_info,
             window_size=window_size,
+            max_dimension=self.render_max_dimension,
+            max_mesh_dimension=self.render_max_mesh_dimension,
             export_stl=self.export_stl,
         )
     
@@ -517,8 +523,8 @@ class InteractiveMeshViewer:
         self,
         camera_info: dict,
         window_size: list | tuple | None = None,
-        max_dimension: int = 4096,
-        max_mesh_dimension: int = 4000,
+        max_dimension: int = 8192,
+        max_mesh_dimension: int = 8000,
         export_stl: bool = False,
     ):
         """
@@ -1107,8 +1113,19 @@ Example:
         type=str,
         default=None,
         help=(
-            "DEM filename under the location folder (e.g. extracted_dem_usgs_style_1m.tif) "
+            "DEM filename under the location folder (e.g. extracted_dem_denoised.tif) "
             "or absolute path; overrides mesh_settings dem_filename."
+        ),
+    )
+    parser.add_argument(
+        "--dem-path",
+        type=str,
+        default=None,
+        metavar="ABSOLUTE_PATH",
+        help=(
+            "Full absolute path to any DEM GeoTIFF, regardless of the location folder "
+            "(e.g. /Volumes/sandisk1/data_cache/mountain_mesh_data/aspen/extracted_dem_denoised.tif). "
+            "Takes precedence over --dem-file and mesh_settings dem_filename."
         ),
     )
     parser.add_argument(
@@ -1117,12 +1134,26 @@ Example:
         default=0.0,
         help="Shift mesh vertically as percent of image height; positive moves mesh up.",
     )
+    parser.add_argument(
+        "--render-max-dimension",
+        type=int,
+        default=8192,
+        help="Max pixels on the longest side of the rendered PNG.",
+    )
+    parser.add_argument(
+        "--render-max-mesh-dimension",
+        type=int,
+        default=8000,
+        help="Max DEM pixels on the longest side used for the render mesh.",
+    )
     args = parser.parse_args()
     
     # Set up paths
     location_dir = BASE_DIR / args.location_name
     polygon_file = location_dir / "polygon.json"
-    if args.dem_file:
+    if args.dem_path:
+        dem_file = Path(args.dem_path).expanduser().resolve()
+    elif args.dem_file:
         raw = Path(args.dem_file)
         dem_file = raw if raw.is_absolute() else location_dir / raw
     else:
@@ -1186,6 +1217,8 @@ Example:
         polygon_coords,
         dem_path=dem_file,
         vertical_bias_percent=args.vertical_bias_percent,
+        render_max_dimension=args.render_max_dimension,
+        render_max_mesh_dimension=args.render_max_mesh_dimension,
     )
     viewer.run(auto_accept=args.auto_accept, export_stl=args.export_stl)
     return 0
